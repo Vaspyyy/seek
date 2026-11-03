@@ -44,7 +44,7 @@ words only. An invalid regex is searched as plain text.
   --partial   identifiers also inside longer words (speed finds speedMult)
   -g GLOB     only files matching GLOB ("*.js", "src/**", "!*_test.go"); repeatable
   -u          also ignored files, caches and dot-folders
-  -b N        about how many lines to print (default 150, with -s 400)
+  -b N        about how many lines to print (default 100, with -s 300)
   -e PATTERN  a pattern that starts with "-"
   -A          plain output without colors (the default when not on a terminal)
   --version
@@ -109,9 +109,9 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	render.Order(gs)
 	budget := o.budget
 	if !o.budgetSet {
-		budget = 150
+		budget = 100
 		if o.bodies {
-			budget = 400
+			budget = 300
 		}
 	}
 	ro := render.Options{Budget: budget - 1, Color: color, Context: o.context, Bodies: o.bodies, Counts: o.counts}
@@ -128,12 +128,16 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 		hints(out, o, p, paths)
 		return 1
 	}
-	head := fmt.Sprintf("seek: %s in %s: %s in %s", describe(p), scope, plural(hits, "hit"), plural(len(gs), "file"))
-	if d := defsLine(gs, 3); d != "" {
+	head := fmt.Sprintf("seek: %s: %s in %s", describe(p), plural(hits, "hit"), plural(len(gs), "file"))
+	if len(o.paths) > 0 || len(o.globs) > 0 || st.TooBig > 0 {
+		head = fmt.Sprintf("seek: %s in %s: %s in %s", describe(p), scope, plural(hits, "hit"), plural(len(gs), "file"))
+	}
+	layout := render.Plan(gs, ro)
+	if d := defsLine(gs, 3, p, layout); d != "" {
 		head += "; defined at " + d
 	}
 	fmt.Fprintln(out, head)
-	render.Files(out, gs, ro)
+	render.Print(out, gs, layout, ro)
 	return 0
 }
 
@@ -222,17 +226,22 @@ func scopeOf(o options, st search.Stats) string {
 }
 
 // defsLine lists where the pattern is defined: "src/a.js:12 (function f)".
-func defsLine(gs []*group.File, n int) string {
+// Only definitions the output doesn't show are listed.
+func defsLine(gs []*group.File, n int, p *search.Pattern, l *render.Layout) string {
 	var parts []string
 	total := 0
-	for _, f := range gs {
-		if f.Kind != "" {
+	for i, f := range gs {
+		if f.Kind != "" || l.Visible(i, f) {
 			continue
 		}
 		for _, d := range f.Defs {
 			total++
 			if len(parts) < n {
-				parts = append(parts, fmt.Sprintf("%s:%d (%s %s)", f.Path, d.Line, d.Kind, d.Name))
+				s := fmt.Sprintf("%s:%d", f.Path, d.Line)
+				if len(p.Words) != 1 || lastPart(d.Name) != p.Words[0] {
+					s += " (" + d.Name + ")" // say which, when it isn't plain from the pattern
+				}
+				parts = append(parts, s)
 			}
 		}
 	}
@@ -308,11 +317,7 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 			if d.End > d.Line {
 				rng += "-" + strconv.Itoa(d.End)
 			}
-			sig := d.Sig
-			if !d.Outline {
-				sig += "  (by keyword)"
-			}
-			fmt.Fprintf(out, "%s:%s  %s\n", f.Path, rng, sig)
+			fmt.Fprintf(out, "%s:%s  %s\n", f.Path, rng, d.Sig)
 			shown++
 		}
 	}
@@ -331,7 +336,7 @@ func onlyDefs(f *group.File, defs []group.Def) *group.File {
 	for _, g := range f.Groups {
 		var hs []group.Hit
 		for _, h := range g.Hits {
-			if lines[h.Line] && h.Label == "definition" {
+			if lines[h.Line] {
 				hs = append(hs, h)
 			}
 		}

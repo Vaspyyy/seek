@@ -123,10 +123,10 @@ func TestGroupsAndLabels(t *testing.T) {
 		t.Fatalf("exit %d", code)
 	}
 	expect(t, out,
-		`seek: "Open" (whole word) in 2 files: 5 hits in 1 file; defined at shop/repo.go:11 (func Repo.Open)`,
-		"shop/repo.go  23 lines, 5 hits (1 definition, 2 in comments, 1 in a string)",
+		`seek: "Open" (whole word): 5 hits in 1 file`+"\n",
+		"shop/repo.go  23 lines\n",
 		"  func Repo.Open  L11-18\n    10 // Open opens a repository.  (comment)\n    11 func",
-		"    11 func (r *Repo) Open(path string) error {  (definition)",
+		"    11 func (r *Repo) Open(path string) error {\n",
 		"    14 _ = strings.TrimSpace(path) // Open is fine  (comment)",
 		`    15 msg := "Open failed"  (string)`,
 		"  func use  L20-23",
@@ -135,13 +135,12 @@ func TestGroupsAndLabels(t *testing.T) {
 	out, _ = seek(t, "setSpeed|speed")
 	expect(t, out,
 		`"setSpeed|speed" (whole words)`,
-		"defined at web/controls.js:15 (function setSpeed)",
-		"  (top level)\n     1 import { setSpeed } from \"./speed.js\";  (import)",
+		"  (top level)\n     1 import { setSpeed } from \"./speed.js\";\n",
 		"  function createControls.bindSpeed  L4-6",
 		"  const createControls.reset  L7-11",
-		"     8 let speed = 1;  (declaration)",
-		"     9 speed += 2;  (assignment)",
-		"    15 export function setSpeed(i) {  (definition)",
+		"     8 let speed = 1;\n",
+		"     9 speed += 2;\n",
+		"    15 export function setSpeed(i) {\n",
 	)
 	// the file with the definition comes first
 	if strings.Index(out, "web/controls.js") > strings.Index(out, "shop/") && strings.Contains(out, "shop/") {
@@ -159,7 +158,7 @@ func TestBudgetFallsBackToCounts(t *testing.T) {
 	write("big.go", b.String())
 	write("other.go", "package big\n\nfunc g() {\n\ttick()\n}\n")
 	out, _ := seek(t, "-b", "20", "tick")
-	expect(t, out, "big.go  202 lines, 80 hits in 40 places: f0 2, f1 2, f2 2, f3 2, +36 more", "other.go  5 lines, 1 hit\n  func g  L3-5\n    4 tick()")
+	expect(t, out, "big.go  202 lines, 80 hits in 40 places: f0 2, f1 2, f2 2, f3 2, +36 more", "other.go  5 lines\n  func g  L3-5\n    4 tick()")
 	out, _ = seek(t, "-b", "60", "tick")
 	expect(t, out, "  func f0  L3-6  2 hits: L4, 5")
 	out, _ = seek(t, "-c", "tick")
@@ -182,14 +181,17 @@ func TestDefinitionsOnly(t *testing.T) {
 	out, _ = seek(t, "-d", "setSpeed")
 	expect(t, out, "web/controls.js:15-17  export function setSpeed(i)", "other hits elsewhere")
 	reject(t, out, "controls.js:1-")
+	write("web/conf.js", "export const LIMIT = 5;\nfunction f() {\n\tconst LIMIT = 2;\n\treturn LIMIT;\n}\n")
+	out, _ = seek(t, "-d", "LIMIT")
+	expect(t, out, "1 definition, 2 other hits", "web/conf.js:1  export const LIMIT = 5;") // module level only
 	out, _ = seek(t, "-ds", "setSpeed")
-	expect(t, out, "  function setSpeed  L15-17\n    15: export function setSpeed(i) {  (definition)\n    16- \treturn i;\n    17- }")
+	expect(t, out, "  function setSpeed  L15-17\n    15: export function setSpeed(i) {\n    16- \treturn i;\n    17- }")
 	out, code = seek(t, "-d", "nothing")
 	if code != 1 || !strings.Contains(out, "no definition found") {
 		t.Errorf("exit %d:\n%s", code, out)
 	}
-	out, _ = seek(t, "-d", "msg")
-	expect(t, out, "no definition found", "seek msg lists them")
+	out, _ = seek(t, "-d", "total")
+	expect(t, out, "no definition found", "seek total lists them") // declared inside a function: not a definition
 }
 
 func TestBodies(t *testing.T) {
@@ -225,7 +227,7 @@ func TestNoHitsHints(t *testing.T) {
 		t.Errorf("exit %d", code)
 	}
 	expect(t, out, "no hits", "load_map  1 hit, defined at map.js:2 (function)", "loadWorldMap  1 hit, defined at map.js:1 (function)",
-		"LoadMapper  1 hit, map.js")
+		"LoadMapper  1 hit, defined at map.js:3 (const)")
 	out, _ = seek(t, "rebuildfrontline")
 	expect(t, out, "ignoring case: 1 hit in 1 file (rebuildFrontline): seek -i rebuildfrontline")
 	out, _ = seek(t, "rebuildFrontLine")
@@ -238,7 +240,7 @@ func TestPatterns(t *testing.T) {
 	out, _ := seek(t, "foo(")
 	expect(t, out, `"foo(" (not a valid regex (missing closing ): `+"`foo(`"+`), searched as text)`, "2 foo(bar);")
 	out, _ = seek(t, "$scope")
-	expect(t, out, "1 const $scope = 1;  (declaration)")
+	expect(t, out, "1 const $scope = 1;\n")
 	out, _ = seek(t, "speed")
 	reject(t, out, "speedMult")
 	out, _ = seek(t, "--partial", "speed")
@@ -298,7 +300,7 @@ func TestPlainFolderSkipsCaches(t *testing.T) {
 	write("__pycache__/app.txt", "needle\n")
 	write(".hidden/x.txt", "needle\n")
 	out, _ := seek(t, "needle")
-	expect(t, out, "app.py", "1 needle = 1  (assignment)")
+	expect(t, out, "app.py", "1 needle = 1\n")
 	reject(t, out, "node_modules", "__pycache__", ".hidden")
 }
 

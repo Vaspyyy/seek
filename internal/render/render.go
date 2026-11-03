@@ -80,9 +80,25 @@ func (w *writer) line(format string, args ...any) {
 	fmt.Fprintf(w.w, format+"\n", args...)
 }
 
+// Layout is how much of each file fits the budget.
+type Layout struct {
+	level []int // per shown file: 1 one line, 2 a line per definition, 3 hit lines, 4 whole definitions
+}
+
+// Visible reports whether file i's definitions can be seen in the output.
+func (l *Layout) Visible(i int, f *group.File) bool {
+	return i < len(l.level) && (l.level[i] >= 3 || l.level[i] == 2 && f.Outlined)
+}
+
 // Files prints the files (already ordered) within the budget.
 func Files(out io.Writer, files []*group.File, o Options) {
-	w := &writer{w: out, c: colors(o.Color), o: o}
+	Print(out, files, Plan(files, o), o)
+}
+
+// Plan decides how much of each file is shown: every file gets a line,
+// then, in order, a line per definition, then the hit lines (or bodies).
+func Plan(files []*group.File, o Options) *Layout {
+	w := &writer{o: o}
 	room := max(o.Budget, 1)
 	shown := len(files)
 	if shown > room {
@@ -111,9 +127,16 @@ func Files(out io.Writer, files []*group.File, o Options) {
 			}
 		}
 	}
-	for i := range level {
-		w.file(files[i], max(level[i], 1))
+	return &Layout{level: level}
+}
+
+// Print prints the files as planned.
+func Print(out io.Writer, files []*group.File, l *Layout, o Options) {
+	w := &writer{w: out, c: colors(o.Color), o: o}
+	for i, lv := range l.level {
+		w.file(files[i], max(lv, 1))
 	}
+	shown := len(l.level)
 	if n := len(files) - shown; n > 0 {
 		hits := 0
 		var names []string
@@ -198,7 +221,8 @@ func (w *writer) file(f *group.File, lv int) {
 		w.line("%s: L%s", head, joinCapped(ls, 12))
 		return
 	}
-	w.line("%s", head)
+	// the hit lines follow: they show the labels themselves
+	w.line("%s%s%s  %s", c.path, f.Path, c.reset, plural(f.Lines, "line"))
 	width := len(strconv.Itoa(lastLine(f)))
 	for _, g := range f.Groups {
 		ind := "  "
@@ -218,7 +242,7 @@ func (w *writer) file(f *group.File, lv int) {
 			text := l.text
 			if l.hit != nil {
 				text = w.highlight(*l.hit, lv == 4 || w.o.Context > 0)
-				if l.hit.Label != "" {
+				if shownLabel[l.hit.Label] {
 					text += "  " + c.label + "(" + l.hit.Label + ")" + c.reset
 				}
 				w.line("%s%s%*d%s%s %s", ind, c.faint, width, l.n, sep(':', lv, w.o.Context), c.reset, text)
@@ -228,6 +252,10 @@ func (w *writer) file(f *group.File, lv int) {
 		}
 	}
 }
+
+// shownLabel: labels a hit line gets; the others (definition, import,
+// declaration, assignment) are plain from the line itself.
+var shownLabel = map[string]bool{"comment": true, "string": true}
 
 // sep is grep's marker after a line number (":" for hits, "-" for
 // context), shown only when there are context lines to tell apart.

@@ -104,8 +104,10 @@ func Build(f *search.File, p *search.Pattern) *File {
 			out.Defs = append(out.Defs, Def{Kind: s.Kind, Name: g.Name, Sig: s.Sig, Line: s.Line, End: s.End, Outline: true})
 		} else {
 			hit.Label = classify(h, st)
-			if hit.Label == "definition" {
-				out.Defs = append(out.Defs, Def{Kind: "def", Name: h.Text[h.Spans[0][0]:h.Spans[0][1]], Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line})
+			// a definition by keyword, or a variable declared outside any
+			// definition (module level), defines what was searched for
+			if hit.Label == "definition" || si < 0 && topLevelDecl(h, hit.Label, st) {
+				out.Defs = append(out.Defs, Def{Kind: declKind(h), Name: h.Text[h.Spans[0][0]:h.Spans[0][1]], Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line})
 			}
 		}
 		g.Hits = append(g.Hits, hit)
@@ -158,6 +160,28 @@ func commentLine(l string, st style) bool {
 func decorator(l string) bool {
 	t := strings.TrimSpace(l)
 	return strings.HasPrefix(t, "@") || strings.HasPrefix(t, "#[")
+}
+
+// topLevelDecl: a declaration (const x = …) or, in Python and other
+// languages without a keyword, an assignment at the start of an unindented line.
+func topLevelDecl(h search.Hit, label string, st style) bool {
+	switch label {
+	case "declaration":
+		return h.Text == strings.TrimLeft(h.Text, " \t")
+	case "assignment":
+		return st.line != nil && st.line[0] == "#" && h.Spans[0][0] == 0
+	}
+	return false
+}
+
+var kindRe = regexp.MustCompile(`\b(function\*?|def|fn|func|class|struct|enum|interface|trait|type|module|namespace|record|object|union|impl|const|let|var|val|static|local|global)\b`)
+
+// declKind is the keyword that defines a hit's name: const, class, def, …
+func declKind(h search.Hit) string {
+	if m := kindRe.FindAllString(h.Text[:h.Spans[0][0]], -1); len(m) > 0 {
+		return m[len(m)-1]
+	}
+	return "variable"
 }
 
 // innermost is the deepest symbol whose lines contain n, or -1.
