@@ -30,13 +30,14 @@ type stat struct {
 }
 
 // Similar returns up to limit names similar to any of words, best first.
-func Similar(words []string, paths []string, limit int) []Name {
+// With fold, names that differ only in case aren't similar: they'd have matched.
+func Similar(words []string, paths []string, limit int, fold bool) []Name {
 	counts := tokens(paths)
 	var out []Name
 	for tok, st := range counts {
 		best := 0
 		for _, w := range words {
-			if s := score(lastPart(w), tok); s > 0 && (best == 0 || s < best) {
+			if s := score(lastPart(w), tok); s > 0 && !(fold && s == 1) && (best == 0 || s < best) {
 				best = s
 			}
 		}
@@ -135,7 +136,7 @@ func score(q, tok string) int {
 		return 1
 	case squash(lq) == squash(lt):
 		return 2
-	case len(q) >= 4 && distance(lq, lt) <= 1, len(q) >= 8 && distance(lq, lt) <= 2:
+	case len(q) >= 5 && distance(lq, lt) <= 1, len(q) >= 8 && distance(lq, lt) <= 2:
 		return 3
 	case len(parts(q)) > 1 && inOrder(parts(q), parts(tok)):
 		return 4

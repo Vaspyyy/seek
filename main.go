@@ -392,7 +392,7 @@ func hints(out *bufio.Writer, o options, p *search.Pattern, paths []string) {
 	if len(p.Names) == 0 {
 		return
 	}
-	names := suggest.Similar(p.Names, paths, 20)
+	names := suggest.Similar(p.Names, paths, 20, p.Fold)
 	if len(names) == 0 {
 		return
 	}
