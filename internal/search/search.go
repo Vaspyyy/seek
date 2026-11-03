@@ -3,11 +3,13 @@ package search
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"regexp/syntax"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -233,23 +235,48 @@ func Run(paths []string, p *Pattern) ([]*File, Stats) {
 	return out, st
 }
 
-// Read returns a file's contents, or why it isn't searched.
+var binaryExt = map[string]bool{
+	"png": true, "jpg": true, "jpeg": true, "gif": true, "webp": true, "ico": true, "bmp": true, "tif": true, "tiff": true, "psd": true,
+	"avif": true, "heic": true, "mp3": true, "ogg": true, "wav": true, "flac": true, "m4a": true, "opus": true, "mp4": true, "mkv": true,
+	"webm": true, "mov": true, "avi": true, "gz": true, "tgz": true, "xz": true, "zst": true, "bz2": true, "zip": true, "7z": true,
+	"rar": true, "jar": true, "class": true, "war": true, "pdf": true, "ttf": true, "otf": true, "woff": true, "woff2": true, "eot": true,
+	"so": true, "dll": true, "dylib": true, "exe": true, "o": true, "a": true, "lib": true, "obj": true, "pyc": true, "wasm": true,
+	"bin": true, "dat": true, "pak": true, "blend": true, "glb": true, "fbx": true, "ktx2": true, "dds": true, "sqlite": true, "db": true,
+}
+
+// Read returns a file's contents, or why it isn't searched. Known binary
+// types aren't opened, and other files are read only as far as needed to
+// see that they're binary.
 func Read(path string) ([]byte, string) {
-	st, err := os.Stat(path)
+	if binaryExt[strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))] {
+		return nil, "binary"
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, "unreadable"
+	}
+	defer f.Close()
+	st, err := f.Stat()
 	if err != nil {
 		return nil, "unreadable"
 	}
 	if st.Size() > MaxSize {
 		return nil, "too big"
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, "unreadable"
-	}
-	if bytes.IndexByte(data[:min(len(data), 8000)], 0) >= 0 {
+	data := make([]byte, st.Size()+1) // +1: notice a file that grew
+	n, err := io.ReadFull(f, data[:min(len(data), 8000)])
+	if bytes.IndexByte(data[:n], 0) >= 0 {
 		return nil, "binary"
 	}
-	return data, ""
+	if err == nil && n < len(data) {
+		var m int
+		m, err = io.ReadFull(f, data[n:])
+		n += m
+	}
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return nil, "unreadable"
+	}
+	return data[:n], ""
 }
 
 func searchFile(path string, p *Pattern) (*File, string) {
@@ -260,7 +287,12 @@ func searchFile(path string, p *Pattern) (*File, string) {
 	if !p.mayMatch(data) {
 		return nil, ""
 	}
-	hits := Lines(data, p.Re)
+	var hits []Hit
+	if p.need != nil && shortest(p.need) >= 2 {
+		hits = candidateLines(data, p.Re, p.need)
+	} else {
+		hits = Lines(data, p.Re)
+	}
 	if len(hits) == 0 {
 		return nil, ""
 	}
@@ -306,6 +338,60 @@ func Lines(data []byte, re *regexp.Regexp) []Hit {
 		for _, s := range spans {
 			if s[1] > s[0] || len(spans) == 1 {
 				h.Spans = append(h.Spans, [2]int{s[0], s[1]})
+			}
+		}
+		hits = append(hits, h)
+	}
+	return hits
+}
+
+// candidateLines matches re only on the lines that contain one of the
+// required literals, found with bytes.Index: much faster than running the
+// regex over the whole file when it can't skip ahead on its own.
+func candidateLines(data []byte, re *regexp.Regexp, need [][]byte) []Hit {
+	starts := map[int]bool{}
+	for _, lit := range need {
+		for pos := 0; pos < len(data); {
+			i := bytes.Index(data[pos:], lit)
+			if i < 0 {
+				break
+			}
+			at := pos + i
+			start := bytes.LastIndexByte(data[:at], '\n') + 1
+			starts[start] = true
+			end := bytes.IndexByte(data[at:], '\n')
+			if end < 0 {
+				break
+			}
+			pos = at + end + 1
+		}
+	}
+	if len(starts) == 0 {
+		return nil
+	}
+	order := make([]int, 0, len(starts))
+	for s := range starts {
+		order = append(order, s)
+	}
+	sort.Ints(order)
+	var hits []Hit
+	line, at := 1, 0
+	for _, s := range order {
+		line += bytes.Count(data[at:s], []byte{'\n'})
+		at = s
+		end := bytes.IndexByte(data[s:], '\n')
+		if end < 0 {
+			end = len(data) - s
+		}
+		text := strings.TrimSuffix(string(data[s:s+end]), "\r")
+		spans := re.FindAllStringIndex(text, -1)
+		if len(spans) == 0 {
+			continue
+		}
+		h := Hit{Line: line, Text: text}
+		for _, sp := range spans {
+			if sp[1] > sp[0] || len(spans) == 1 {
+				h.Spans = append(h.Spans, [2]int{sp[0], sp[1]})
 			}
 		}
 		hits = append(hits, h)

@@ -9,9 +9,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Vaspyyy/seek/internal/files"
 	"github.com/Vaspyyy/seek/internal/group"
@@ -96,10 +98,7 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 		return 2
 	}
 	found, st := search.Run(paths, p)
-	var gs []*group.File
-	for _, f := range found {
-		gs = append(gs, group.Build(f, p))
-	}
+	gs := buildAll(found, p)
 	if o.list {
 		sort.Slice(gs, func(i, j int) bool { return gs[i].Path < gs[j].Path })
 		for _, f := range gs {
@@ -136,6 +135,29 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	fmt.Fprintln(out, head)
 	render.Files(out, gs, ro)
 	return 0
+}
+
+// buildAll groups the hits of every file, in parallel: outlining is the
+// slow part when many files match.
+func buildAll(found []*search.File, p *search.Pattern) []*group.File {
+	gs := make([]*group.File, len(found))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for range runtime.GOMAXPROCS(0) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				gs[i] = group.Build(found[i], p)
+			}
+		}()
+	}
+	for i := range found {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return gs
 }
 
 func exitCode(found bool) int {
