@@ -190,6 +190,13 @@ func TestDefinitionsOnly(t *testing.T) {
 	if code != 1 || !strings.Contains(out, "no definition found") {
 		t.Errorf("exit %d:\n%s", code, out)
 	}
+	// fields, attributes and enum members define their names
+	write("model.go", "package m\n\ntype File struct {\n\tLines    int\n\tTopLines []string // changed lines\n}\n\nfunc (f *File) n() int { return len(f.TopLines) }\n")
+	write("model.py", "class Cart:\n    count: int = 0\n\n    def add(self):\n        self.count = 1\n")
+	write("model.ts", "export class View {\n\treadonly size = 3;\n\trender() {\n\t\treturn this.size;\n\t}\n}\nenum Color {\n\tRed,\n\tGreen,\n}\n")
+	out, _ = seek(t, "-d", "TopLines|count|size|Green")
+	expect(t, out, "model.go:5  TopLines []string // changed lines", "model.py:2  count: int = 0", "model.ts:2  readonly size = 3;", "model.ts:9  Green,")
+	reject(t, out, "model.go:8", "model.py:5", "model.ts:4")
 	out, _ = seek(t, "-d", "total")
 	expect(t, out, "no definition found", "seek total lists them") // declared inside a function: not a definition
 }

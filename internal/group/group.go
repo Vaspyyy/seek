@@ -98,7 +98,11 @@ func Build(f *search.File, p *search.Pattern) *File {
 			out.Groups = append(out.Groups, g)
 		}
 		hit := Hit{Hit: h}
-		if si >= 0 && isDef(out.Syms[si], h, p) {
+		if si >= 0 && isField(out.Syms[si], h) {
+			hit.Label = "definition"
+			out.Defs = append(out.Defs, Def{Kind: "field", Name: g.Name + "." + h.Text[h.Spans[0][0]:h.Spans[0][1]],
+				Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line})
+		} else if si >= 0 && isDef(out.Syms[si], h, p) {
 			hit.Label = "definition"
 			s := out.Syms[si]
 			out.Defs = append(out.Defs, Def{Kind: s.Kind, Name: g.Name, Sig: s.Sig, Line: s.Line, End: s.End, Outline: true})
@@ -182,6 +186,22 @@ func declKind(h search.Hit) string {
 		return m[len(m)-1]
 	}
 	return "variable"
+}
+
+var (
+	containers  = map[string]bool{"type": true, "struct": true, "class": true, "interface": true, "enum": true, "trait": true, "union": true, "record": true, "object": true}
+	fieldBefore = regexp.MustCompile(`^\s*(?:(?:pub(?:\([^)]*\))?|public|private|protected|internal|readonly|static|final|val|var|let|const|declare|override|abstract|mut|required|late)\s+)*$`)
+	fieldAfter  = regexp.MustCompile(`^(?:\s+[\w*\[\]<>.&(]|\s*[?!]?\s*:[^:]|\s*=[^=>]|\s*[,;]|\s*$|\s*\(|\s*\{)`)
+)
+
+// isField: the hit names a field, attribute, member or (in an interface) a
+// method of the type or class directly around it, at the start of its line.
+func isField(s outline.Symbol, h search.Hit) bool {
+	if !containers[s.Kind] || h.Line == s.Line || len(h.Spans) == 0 {
+		return false
+	}
+	a, b := h.Spans[0][0], h.Spans[0][1]
+	return fieldBefore.MatchString(h.Text[:a]) && fieldAfter.MatchString(h.Text[b:])
 }
 
 // innermost is the deepest symbol whose lines contain n, or -1.
