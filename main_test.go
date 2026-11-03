@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // project makes a temporary folder, changes into it, and returns a
@@ -365,4 +366,26 @@ func TestBodyIncludesDocCommentHit(t *testing.T) {
 	write("a.rs", "/// The label is yellow.\nfn label() -> u32 {\n    1\n}\n")
 	out, _ := seek(t, "-s", "yellow")
 	expect(t, out, "  fn label  L2-4\n    1: /// The label is yellow.  (comment)\n    2- fn label() -> u32 {")
+}
+
+// A pattern of thousands of names finishes quickly, and the header doesn't
+// repeat it in full (found by the first review round).
+func TestHugeWordList(t *testing.T) {
+	write := project(t)
+	write("a.go", "package a\n\nfunc fn42() {}\n\nfunc other() { fn42() }\n")
+	var ws []string
+	for i := 0; i < 3000; i++ {
+		ws = append(ws, "fn"+itoa(i))
+	}
+	start := time.Now()
+	out, _ := seek(t, strings.Join(ws, "|"))
+	if d := time.Since(start); d > 3*time.Second {
+		t.Errorf("took %v", d)
+	}
+	expect(t, out, "(19889 characters)", "2 hits in 1 file", "  func other  L5\n    5 func other() { fn42() }")
+	if len(out) > 1000 {
+		t.Errorf("output too long: %d bytes", len(out))
+	}
+	out, _ = seek(t, "-i", strings.Join(ws, "|")+"|FN42")
+	expect(t, out, "2 hits in 1 file")
 }

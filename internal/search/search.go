@@ -25,6 +25,7 @@ type Pattern struct {
 	Bad   string   // why the pattern was taken as text, if it wasn't a valid regex
 	Expr  string   // what the user typed
 	need  [][]byte // a match contains one of these (nil: no such literal)
+	words map[string]bool // many whole words: found by splitting lines into words
 }
 
 // Options say how to read a pattern.
@@ -94,6 +95,21 @@ func Compile(expr string, o Options) (*Pattern, error) {
 	p.Names = p.Words
 	if p.Names == nil {
 		p.Names = namesIn(expr, o.Fixed || p.Bad != "")
+	}
+	if len(p.Names) > 6 {
+		p.Names = p.Names[:6] // suggestions for the first few are plenty
+	}
+	if p.Smart && len(p.Words) > 16 && plainWords(p.Words) {
+		// a long list of names: one pass per file looking words up in a
+		// set, instead of one search per name
+		p.words = map[string]bool{}
+		for _, w := range p.Words {
+			if o.IgnoreCase {
+				w = strings.ToLower(w)
+			}
+			p.words[w] = true
+		}
+		return p, nil
 	}
 	if !o.IgnoreCase {
 		if sre, err := syntax.Parse(src, syntax.Perl); err == nil {
@@ -188,6 +204,60 @@ func namesIn(expr string, text bool) []string {
 		}
 	}
 	return out
+}
+
+// plainWords: every word is letters, digits and underscores only, so a
+// whole-word match is exactly a word of the line.
+func plainWords(ws []string) bool {
+	for _, w := range ws {
+		for i := 0; i < len(w); i++ {
+			if !isWordByte(w[i]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isWordByte(c byte) bool {
+	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+}
+
+// wordLines finds the lines containing one of the words.
+func wordLines(data []byte, words map[string]bool, fold bool) []Hit {
+	var hits []Hit
+	line := 1
+	for start := 0; start < len(data); line++ {
+		end := bytes.IndexByte(data[start:], '\n')
+		if end < 0 {
+			end = len(data) - start
+		}
+		text := strings.TrimSuffix(string(data[start:start+end]), "\r")
+		var spans [][2]int
+		for i := 0; i < len(text); {
+			if !isWordByte(text[i]) {
+				i++
+				continue
+			}
+			j := i
+			for j < len(text) && isWordByte(text[j]) {
+				j++
+			}
+			w := text[i:j]
+			if fold {
+				w = strings.ToLower(w)
+			}
+			if words[w] {
+				spans = append(spans, [2]int{i, j})
+			}
+			i = j
+		}
+		if spans != nil {
+			hits = append(hits, Hit{Line: line, Text: text, Spans: spans})
+		}
+		start += end + 1
+	}
+	return hits
 }
 
 func shortErr(err error) string {
@@ -315,11 +385,12 @@ func searchFile(path string, p *Pattern) (*File, string) {
 	if skip != "" {
 		return nil, skip
 	}
-	if !p.mayMatch(data) {
-		return nil, ""
-	}
 	var hits []Hit
-	if p.need != nil && shortest(p.need) >= 2 {
+	if p.words != nil {
+		hits = wordLines(data, p.words, p.Fold)
+	} else if !p.mayMatch(data) {
+		return nil, ""
+	} else if p.need != nil && shortest(p.need) >= 2 {
 		hits = candidateLines(data, p.Re, p.need)
 	} else {
 		hits = Lines(data, p.Re)

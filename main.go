@@ -185,7 +185,11 @@ func defsExpr(expr string) string {
 
 // describe says how the pattern was read: "setSpeed" (whole word).
 func describe(p *search.Pattern) string {
-	s := `"` + p.Expr + `"`
+	expr := p.Expr
+	if r := []rune(expr); len(r) > 120 {
+		expr = string(r[:100]) + fmt.Sprintf("… (%d characters)", len(r))
+	}
+	s := `"` + expr + `"`
 	var notes []string
 	switch {
 	case p.Bad != "":
@@ -381,7 +385,7 @@ func hints(out *bufio.Writer, o options, p *search.Pattern, paths []string) {
 			fmt.Fprintf(out, "  ignoring case: %s in %s (%s): seek -i %s\n", plural(n, "hit"), plural(nf, "file"), strings.Join(ws, ", "), shellQuote(o.pattern))
 		}
 	}
-	if p.Smart {
+	if p.Smart && len(p.Words) <= 16 {
 		so := o.so
 		so.Partial = true
 		so.IgnoreCase = so.IgnoreCase || false
