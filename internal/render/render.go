@@ -1,0 +1,497 @@
+// Package render prints search results within a line budget: every file
+// gets a line, then each file a line per definition with hits, then the
+// hit lines themselves (or whole definitions with -s), in order of rank.
+package render
+
+import (
+	"fmt"
+	"io"
+	"path"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/Vaspyyy/seek/internal/group"
+)
+
+// Options control the output.
+type Options struct {
+	Budget  int  // roughly how many lines to print
+	Color   bool // ANSI colors
+	Context int  // lines of context around each hit (-C)
+	Bodies  bool // whole definitions (-s)
+	Counts  bool // at most one line per definition (-c)
+}
+
+type palette struct{ bold, faint, path, sym, match, label, reset string }
+
+func colors(on bool) palette {
+	if !on {
+		return palette{}
+	}
+	return palette{bold: "\x1b[1m", faint: "\x1b[2m", path: "\x1b[1;34m", sym: "\x1b[36m", match: "\x1b[1;31m", label: "\x1b[33m", reset: "\x1b[0m"}
+}
+
+// Rank orders files: source, then tests, docs, data, and last lock files,
+// generated, minified and vendored code.
+func Rank(f *group.File) int {
+	p := strings.ToLower(f.Path)
+	base := path.Base(p)
+	switch {
+	case f.Kind != "":
+		return 5
+	case strings.Contains(p, "testdata/") || strings.Contains(p, "fixtures/") || strings.Contains(p, "snapshots/") || strings.Contains(p, "__snapshots__"):
+		return 4
+	case strings.HasSuffix(p, ".md") || strings.HasSuffix(p, ".txt") || strings.HasSuffix(p, ".rst") || strings.HasPrefix(base, "changelog"):
+		return 3
+	case strings.HasSuffix(base, "_test.go") || strings.HasPrefix(base, "test_") || strings.Contains(base, ".test.") ||
+		strings.Contains(base, ".spec.") || strings.Contains("/"+p, "/tests/") || strings.Contains("/"+p, "/test/") || strings.HasSuffix(base, "_test.py"):
+		return 2
+	case !f.Outlined && dataExt[strings.TrimPrefix(path.Ext(base), ".")]:
+		return 3
+	}
+	return 0
+}
+
+var dataExt = map[string]bool{"json": true, "yaml": true, "yml": true, "toml": true, "csv": true, "tsv": true, "xml": true, "svg": true, "ini": true, "lock": true}
+
+// Order sorts files: those with a definition first, then by rank, then by path.
+func Order(files []*group.File) {
+	sort.SliceStable(files, func(i, j int) bool {
+		a, b := files[i], files[j]
+		da, db := len(a.Defs) > 0 && a.Kind == "", len(b.Defs) > 0 && b.Kind == ""
+		if da != db {
+			return da
+		}
+		if ra, rb := Rank(a), Rank(b); ra != rb {
+			return ra < rb
+		}
+		return a.Path < b.Path
+	})
+}
+
+type writer struct {
+	w io.Writer
+	c palette
+	o Options
+}
+
+func (w *writer) line(format string, args ...any) {
+	fmt.Fprintf(w.w, format+"\n", args...)
+}
+
+// Files prints the files (already ordered) within the budget.
+func Files(out io.Writer, files []*group.File, o Options) {
+	w := &writer{w: out, c: colors(o.Color), o: o}
+	room := max(o.Budget, 1)
+	shown := len(files)
+	if shown > room {
+		shown = max(room-1, 1)
+	}
+	level := make([]int, shown)
+	for i := range level {
+		level[i] = 1
+	}
+	room -= shown
+	cost := func(i, lv int) int { return w.cost(files[i], lv) }
+	top := 3
+	if o.Counts {
+		top = 2
+	} else if o.Bodies {
+		top = 4
+	}
+	for lv := 2; lv <= top; lv++ {
+		for i := range level {
+			if files[i].Kind != "" || level[i] != lv-1 {
+				continue // lock, generated and vendored files stay on one line
+			}
+			if d := cost(i, lv) - cost(i, level[i]); d <= room {
+				room -= d
+				level[i] = lv
+			}
+		}
+	}
+	for i := range level {
+		w.file(files[i], max(level[i], 1))
+	}
+	if n := len(files) - shown; n > 0 {
+		hits := 0
+		var names []string
+		for _, f := range files[shown:] {
+			hits += f.Count()
+			if len(names) < 5 {
+				names = append(names, f.Path)
+			}
+		}
+		more := ""
+		if n > len(names) {
+			more = fmt.Sprintf(", +%d more", n-len(names))
+		}
+		w.line("%s… %s with %s: %s%s (raise -b, or narrow with -g or a path)%s", w.c.faint, plural(n, "more file"), plural(hits, "hit"), strings.Join(names, ", "), more, w.c.reset)
+	}
+}
+
+// cost is how many lines a file takes at a level (1: one line, 2: a line
+// per definition, 3: hit lines, 4: whole definitions).
+func (w *writer) cost(f *group.File, lv int) int {
+	switch lv {
+	case 0, 1:
+		return 1
+	case 2:
+		if !f.Outlined {
+			return 1
+		}
+		return 1 + len(f.Groups)
+	case 3:
+		n := 1
+		for _, g := range f.Groups {
+			if f.Outlined {
+				n++
+			}
+			n += len(w.window(f, g, false))
+		}
+		return n
+	}
+	n := 1
+	for _, g := range f.Groups {
+		if f.Outlined {
+			n++
+		}
+		n += len(w.window(f, g, true))
+	}
+	return n
+}
+
+func (w *writer) file(f *group.File, lv int) {
+	c := w.c
+	n := f.Count()
+	desc := []string{plural(f.Lines, "line")}
+	if f.Kind != "" {
+		desc = append(desc, f.Kind)
+	}
+	hits := plural(n, "hit")
+	if labels := labelCounts(f); labels != "" {
+		hits += " (" + labels + ")"
+	}
+	desc = append(desc, hits)
+	head := fmt.Sprintf("%s%s%s  %s", c.path, f.Path, c.reset, strings.Join(desc, ", "))
+	switch {
+	case lv == 1 && f.Kind != "":
+		var ls []string
+		for _, g := range f.Groups {
+			for _, h := range g.Hits {
+				ls = append(ls, strconv.Itoa(h.Line))
+			}
+		}
+		w.line("%s: L%s", head, joinCapped(ls, 8))
+		return
+	case lv == 1 && f.Outlined && len(f.Groups) > 0:
+		w.line("%s in %s: %s", head, plural(len(f.Groups), "place"), w.topGroups(f, 4))
+		return
+	case lv == 1 || lv == 2 && !f.Outlined:
+		var ls []string
+		for _, g := range f.Groups {
+			for _, h := range g.Hits {
+				ls = append(ls, strconv.Itoa(h.Line))
+			}
+		}
+		w.line("%s: L%s", head, joinCapped(ls, 12))
+		return
+	}
+	w.line("%s", head)
+	width := len(strconv.Itoa(lastLine(f)))
+	for _, g := range f.Groups {
+		ind := "  "
+		if lv == 2 {
+			w.line("  %s  %s", w.groupHead(g), w.groupCount(g))
+			continue
+		}
+		if f.Outlined {
+			w.line("  %s", w.groupHead(g))
+			ind = "    "
+		}
+		for _, l := range w.window(f, g, lv == 4) {
+			if l.gap {
+				w.line("%s%s%s…%s", ind, c.faint, strings.Repeat(" ", width-1), c.reset)
+				continue
+			}
+			text := l.text
+			if l.hit != nil {
+				text = w.highlight(*l.hit, lv == 4 || w.o.Context > 0)
+				if l.hit.Label != "" {
+					text += "  " + c.label + "(" + l.hit.Label + ")" + c.reset
+				}
+				w.line("%s%s%*d%s%s %s", ind, c.faint, width, l.n, sep(':', lv, w.o.Context), c.reset, text)
+			} else {
+				w.line("%s%s%*d%s%s %s", ind, c.faint, width, l.n, sep('-', lv, w.o.Context), c.reset, clipLine(text, 300))
+			}
+		}
+	}
+}
+
+// sep is grep's marker after a line number (":" for hits, "-" for
+// context), shown only when there are context lines to tell apart.
+func sep(ch byte, lv, ctx int) string {
+	if lv == 4 || ctx > 0 {
+		return string(ch)
+	}
+	return ""
+}
+
+func lastLine(f *group.File) int {
+	n := 1
+	for _, g := range f.Groups {
+		if w := g.End; w > n {
+			n = w
+		}
+		for _, h := range g.Hits {
+			n = max(n, h.Line)
+		}
+	}
+	return min(n, f.Lines)
+}
+
+func (w *writer) groupHead(g *group.Group) string {
+	c := w.c
+	if g.Sym < 0 {
+		return c.faint + "(top level)" + c.reset
+	}
+	rng := "L" + strconv.Itoa(g.Line)
+	if g.End > g.Line {
+		rng += "-" + strconv.Itoa(g.End)
+	}
+	return fmt.Sprintf("%s %s%s%s  %s", g.Kind, c.sym, g.Name, c.reset, rng)
+}
+
+// groupCount is a definition's hits on one line: "14 hits (1 assignment): L11678, L11687, …".
+func (w *writer) groupCount(g *group.Group) string {
+	var ls []string
+	labels := map[string]int{}
+	for _, h := range g.Hits {
+		ls = append(ls, strconv.Itoa(h.Line))
+		if h.Label != "" {
+			labels[h.Label]++
+		}
+	}
+	s := plural(len(g.Hits), "hit")
+	var parts []string
+	for _, l := range []string{"definition", "declaration", "assignment", "import", "comment", "string"} {
+		if n := labels[l]; n > 0 {
+			parts = append(parts, labelCount(l, n))
+		}
+	}
+	if len(parts) > 0 {
+		s += " (" + strings.Join(parts, ", ") + ")"
+	}
+	return s + ": L" + joinCapped(ls, 8)
+}
+
+func labelCount(l string, n int) string {
+	if n == 1 {
+		if l == "comment" || l == "string" {
+			return "1 in a " + l
+		}
+		return "1 " + l
+	}
+	return fmt.Sprintf("%d %s", n, plurals[l])
+}
+
+// topGroups names the definitions with the most hits: "tick 9, render 7".
+func (w *writer) topGroups(f *group.File, n int) string {
+	gs := append([]*group.Group(nil), f.Groups...)
+	sort.SliceStable(gs, func(i, j int) bool { return len(gs[i].Hits) > len(gs[j].Hits) })
+	var parts []string
+	for _, g := range gs[:min(n, len(gs))] {
+		name := g.Name
+		if g.Sym < 0 {
+			name = "(top level)"
+		}
+		parts = append(parts, fmt.Sprintf("%s %d", name, len(g.Hits)))
+	}
+	if len(gs) > n {
+		parts = append(parts, fmt.Sprintf("+%d more", len(gs)-n))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func labelCounts(f *group.File) string {
+	var parts []string
+	for _, l := range []string{"definition", "declaration", "assignment", "import", "comment", "string"} {
+		if n := f.Labelled(l); n > 0 {
+			parts = append(parts, labelCount(l, n))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+var plurals = map[string]string{"definition": "definitions", "declaration": "declarations", "assignment": "assignments",
+	"import": "imports", "comment": "in comments", "string": "in strings"}
+
+type shownLine struct {
+	n    int
+	text string
+	hit  *group.Hit
+	gap  bool
+}
+
+// bodyMax is the longest definition printed whole with -s; longer ones
+// show their first line and the lines around each hit.
+const bodyMax = 80
+
+// window is the lines a group shows: its hits (with -C context), or with
+// whole set its whole definition (or windows around the hits).
+func (w *writer) window(f *group.File, g *group.Group, whole bool) []shownLine {
+	ctx := w.o.Context
+	hits := map[int]*group.Hit{}
+	for i := range g.Hits {
+		hits[g.Hits[i].Line] = &g.Hits[i]
+	}
+	if !whole && ctx == 0 {
+		var out []shownLine
+		for i := range g.Hits {
+			out = append(out, shownLine{n: g.Hits[i].Line, hit: &g.Hits[i]})
+		}
+		return out
+	}
+	lines := splitLines(f.Data)
+	want := map[int]bool{}
+	if whole && g.Sym >= 0 && g.End-g.Line+1 <= bodyMax {
+		for n := g.Line; n <= g.End; n++ {
+			want[n] = true
+		}
+	} else {
+		if whole {
+			ctx = max(ctx, 3)
+			if g.Sym >= 0 {
+				want[g.Line] = true
+			}
+		}
+		for _, h := range g.Hits {
+			for n := h.Line - ctx; n <= h.Line+ctx; n++ {
+				if n >= 1 && n <= len(lines) && (g.Sym < 0 || n >= g.Line && n <= g.End || !whole) {
+					want[n] = true
+				}
+			}
+		}
+	}
+	var ns []int
+	for n := range want {
+		if n >= 1 && n <= len(lines) {
+			ns = append(ns, n)
+		}
+	}
+	sort.Ints(ns)
+	var out []shownLine
+	for k, n := range ns {
+		if k > 0 && n > ns[k-1]+1 {
+			out = append(out, shownLine{gap: true})
+		}
+		out = append(out, shownLine{n: n, text: lines[n-1], hit: hits[n]})
+	}
+	if whole && g.Sym >= 0 && len(ns) > 0 && ns[len(ns)-1] < g.End {
+		out = append(out, shownLine{gap: true}) // the definition goes on
+	}
+	return out
+}
+
+func splitLines(data []byte) []string {
+	s := strings.ReplaceAll(string(data), "\r\n", "\n")
+	s = strings.TrimSuffix(s, "\n")
+	return strings.Split(s, "\n")
+}
+
+// highlight prints a hit line with its matches marked, clipped around the
+// first match if it's long. raw keeps its indentation.
+func (w *writer) highlight(h group.Hit, raw bool) string {
+	text := h.Text
+	spans := h.Spans
+	if !raw {
+		trimmed := strings.TrimLeft(text, " \t")
+		cut := len(text) - len(trimmed)
+		text = strings.TrimRight(trimmed, " \t")
+		spans = shift(spans, -cut, len(text))
+	}
+	const maxLen = 160
+	if len(text) > maxLen && len(spans) > 0 {
+		from := max(0, spans[0][0]-50)
+		for from > 0 && !utf8Start(text[from]) {
+			from--
+		}
+		to := min(len(text), from+maxLen)
+		for to < len(text) && !utf8Start(text[to]) {
+			to++
+		}
+		pre, post := "", ""
+		if from > 0 {
+			pre = "…"
+		}
+		if to < len(text) {
+			post = "…"
+		}
+		spans = shift(spans, -from, to-from)
+		text = text[from:to]
+		return pre + w.mark(text, spans) + post
+	}
+	return w.mark(text, spans)
+}
+
+func utf8Start(b byte) bool { return b&0xC0 != 0x80 }
+
+func shift(spans [][2]int, by, limit int) [][2]int {
+	var out [][2]int
+	for _, s := range spans {
+		a, b := s[0]+by, s[1]+by
+		if b <= 0 || a >= limit {
+			continue
+		}
+		out = append(out, [2]int{max(a, 0), min(b, limit)})
+	}
+	return out
+}
+
+func (w *writer) mark(text string, spans [][2]int) string {
+	if w.c.match == "" || len(spans) == 0 {
+		return text
+	}
+	var b strings.Builder
+	at := 0
+	for _, s := range spans {
+		if s[0] < at {
+			continue
+		}
+		b.WriteString(text[at:s[0]])
+		b.WriteString(w.c.match + text[s[0]:s[1]] + w.c.reset)
+		at = s[1]
+	}
+	b.WriteString(text[at:])
+	return b.String()
+}
+
+func clipLine(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := n
+	for cut > 0 && !utf8Start(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
+func joinCapped(ls []string, n int) string {
+	if len(ls) <= n {
+		return strings.Join(ls, ", ")
+	}
+	return strings.Join(ls[:n], ", ") + fmt.Sprintf(", +%d more", len(ls)-n)
+}
+
+func plural(n int, word string) string {
+	if n == 1 {
+		return "1 " + word
+	}
+	switch {
+	case strings.HasSuffix(word, "s"):
+		return fmt.Sprintf("%d %ses", n, word)
+	}
+	return fmt.Sprintf("%d %ss", n, word)
+}
