@@ -5,6 +5,7 @@ package files
 
 import (
 	"bytes"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -194,6 +195,17 @@ func globRe(g string) (*regexp.Regexp, error) {
 			b.WriteString("[^/]*")
 		case c == '?':
 			b.WriteString("[^/]")
+		case c == '[':
+			end := strings.IndexByte(g[i+1:], ']')
+			if end < 0 {
+				return nil, fmt.Errorf("glob %q: [ without a closing ]", g)
+			}
+			class := g[i+1 : i+1+end]
+			if strings.HasPrefix(class, "!") {
+				class = "^" + class[1:]
+			}
+			b.WriteString("[" + strings.ReplaceAll(class, `\`, `\\`) + "]")
+			i += end + 1
 		case c == '{':
 			depth++
 			b.WriteString("(?:")

@@ -12,19 +12,22 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Pattern is a compiled search pattern.
 type Pattern struct {
 	Re    *regexp.Regexp
-	Words []string // the identifiers searched for, if the pattern is a list of them
-	Names []string // identifiers in the pattern, also in a regex (for suggestions)
-	Smart bool     // whole words only, because the pattern is a list of identifiers
-	Text  bool     // searched as plain text (-F, or not a valid regex)
-	Fold  bool     // case-insensitive
-	Bad   string   // why the pattern was taken as text, if it wasn't a valid regex
-	Expr  string   // what the user typed
-	need  [][]byte // a match contains one of these (nil: no such literal)
+	file  *regexp.Regexp  // Re for a whole file: ^ and $ at every line
+	Words []string        // the identifiers searched for, if the pattern is a list of them
+	Names []string        // identifiers in the pattern, also in a regex (for suggestions)
+	Smart bool            // whole words only, because the pattern is a list of identifiers
+	Text  bool            // searched as plain text (-F, or not a valid regex)
+	Fold  bool            // case-insensitive
+	Bad   string          // why the pattern was taken as text, if it wasn't a valid regex
+	Expr  string          // what the user typed
+	need  [][]byte        // a match contains one of these (nil: no such literal)
 	words map[string]bool // many whole words: found by splitting lines into words
 }
 
@@ -36,7 +39,7 @@ type Options struct {
 	Partial    bool // no whole-word matching for identifiers
 }
 
-var identRe = regexp.MustCompile(`^\$?[A-Za-z_][\w]*(?:(?:\.|::)[A-Za-z_][\w]*)*$`)
+var identRe = regexp.MustCompile(`^\$?[\p{L}_][\p{L}\p{N}_]*(?:(?:\.|::)[\p{L}_][\p{L}\p{N}_]*)*$`)
 
 // Compile reads expr. A pattern that is one identifier or several joined
 // by | ("setSpeed", "Repo.Open", "a|b|c") matches whole words only, unless
@@ -62,10 +65,14 @@ func Compile(expr string, o Options) (*Pattern, error) {
 		for _, a := range alts {
 			q := regexp.QuoteMeta(a)
 			if !o.Partial {
-				if !strings.HasPrefix(a, "$") {
+				// \b knows only ASCII letters; boundaries next to other
+				// letters are checked on each match (wholeWord)
+				if isWordByte(a[0]) {
 					q = `\b` + q
 				}
-				q += `\b`
+				if isWordByte(a[len(a)-1]) {
+					q += `\b`
+				}
 			}
 			parts = append(parts, q)
 		}
@@ -92,6 +99,7 @@ func Compile(expr string, o Options) (*Pattern, error) {
 		return nil, err
 	}
 	p.Re = re
+	p.file = regexp.MustCompile("(?m)" + src)
 	p.Names = p.Words
 	if p.Names == nil {
 		p.Names = namesIn(expr, o.Fixed || p.Bad != "")
@@ -260,6 +268,45 @@ func wordLines(data []byte, words map[string]bool, fold bool) []Hit {
 	return hits
 }
 
+// wholeWord: the match isn't part of a longer word made of non-ASCII
+// letters (ber_limit inside über_limit), which \b can't see.
+func wholeWord(text string, a, b int) bool {
+	if a > 0 {
+		if r, _ := utf8.DecodeLastRuneInString(text[:a]); wordRune(r) {
+			return false
+		}
+	}
+	if b < len(text) {
+		if r, _ := utf8.DecodeRuneInString(text[b:]); wordRune(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func wordRune(r rune) bool { return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r) }
+
+// Keep drops spans that aren't whole words when the pattern wants them.
+func (p *Pattern) keep(hits []Hit) []Hit {
+	if !p.Smart {
+		return hits
+	}
+	out := hits[:0]
+	for _, h := range hits {
+		var sp [][2]int
+		for _, s := range h.Spans {
+			if wholeWord(h.Text, s[0], s[1]) {
+				sp = append(sp, s)
+			}
+		}
+		if len(sp) > 0 {
+			h.Spans = sp
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
 func shortErr(err error) string {
 	s := err.Error()
 	s = strings.TrimPrefix(s, "error parsing regexp: ")
@@ -393,8 +440,9 @@ func searchFile(path string, p *Pattern) (*File, string) {
 	} else if p.need != nil && shortest(p.need) >= 2 {
 		hits = candidateLines(data, p.Re, p.need)
 	} else {
-		hits = Lines(data, p.Re)
+		hits = lines(data, p.file, p.Re)
 	}
+	hits = p.keep(hits)
 	if len(hits) == 0 {
 		return nil, ""
 	}
@@ -402,8 +450,15 @@ func searchFile(path string, p *Pattern) (*File, string) {
 }
 
 // Lines returns the lines of data that match re.
-func Lines(data []byte, re *regexp.Regexp) []Hit {
-	locs := re.FindAllIndex(data, -1)
+func Lines(data []byte, re *regexp.Regexp) []Hit { return lines(data, re, re) }
+
+// lines finds the candidate lines with fileRe on the whole file (compiled
+// with (?m), so ^ and $ match at every line) and matches re on each.
+func lines(data []byte, fileRe, re *regexp.Regexp) []Hit {
+	locs := fileRe.FindAllIndex(data, -1)
+	if n := len(locs); n > 0 && len(data) > 0 && data[len(data)-1] == '\n' && locs[n-1][0] == len(data) {
+		locs = locs[:n-1] // after the last line break there is no line
+	}
 	if len(locs) == 0 {
 		return nil
 	}

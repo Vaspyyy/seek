@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Vaspyyy/seek/internal/files"
 	"github.com/Vaspyyy/seek/internal/group"
@@ -416,8 +418,15 @@ func hints(out *bufio.Writer, o options, p *search.Pattern, paths []string) {
 		}
 		return cs[i].def != "" && cs[j].def == ""
 	})
+	// the closest few: a typo's fix, not a list of everything sharing a part
+	keep := cs[:0]
+	for _, c := range cs {
+		if c.score <= cs[0].score+2 && len(keep) < 6 {
+			keep = append(keep, c)
+		}
+	}
 	fmt.Fprintln(out, "  similar names:")
-	for _, c := range cs[:min(len(cs), 8)] {
+	for _, c := range keep {
 		n := c.n
 		where := n.Paths[0]
 		if c.def != "" {
@@ -431,14 +440,20 @@ func hints(out *bufio.Writer, o options, p *search.Pattern, paths []string) {
 
 // wordAt widens a match to the identifier around it.
 func wordAt(text string, a, b int) string {
-	isW := func(c byte) bool {
-		return c == '_' || c == '$' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+	isW := func(r rune) bool { return r == '_' || r == '$' || unicode.IsLetter(r) || unicode.IsDigit(r) }
+	for a > 0 {
+		r, n := utf8.DecodeLastRuneInString(text[:a])
+		if !isW(r) {
+			break
+		}
+		a -= n
 	}
-	for a > 0 && isW(text[a-1]) {
-		a--
-	}
-	for b < len(text) && isW(text[b]) {
-		b++
+	for b < len(text) {
+		r, n := utf8.DecodeRuneInString(text[b:])
+		if !isW(r) {
+			break
+		}
+		b += n
 	}
 	return text[a:b]
 }

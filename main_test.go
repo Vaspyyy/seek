@@ -235,7 +235,8 @@ func TestNoHitsHints(t *testing.T) {
 		t.Errorf("exit %d", code)
 	}
 	expect(t, out, "no hits", "load_map  1 hit, defined at map.js:2 (function)", "loadWorldMap  1 hit, defined at map.js:1 (function)",
-		"LoadMapper  1 hit, defined at map.js:3 (const)")
+)
+	reject(t, out, "LoadMapper") // much less alike than load_map: not shown
 	out, _ = seek(t, "rebuildfrontline")
 	expect(t, out, "ignoring case: 1 hit in 1 file (rebuildFrontline): seek -i rebuildfrontline")
 	out, _ = seek(t, "rebuildFrontLine")
@@ -388,4 +389,29 @@ func TestHugeWordList(t *testing.T) {
 	}
 	out, _ = seek(t, "-i", strings.Join(ws, "|")+"|FN42")
 	expect(t, out, "2 hits in 1 file")
+}
+
+// Regressions from the first review round: anchors and empty matches,
+// non-ASCII names, globs.
+func TestFirstRoundPatterns(t *testing.T) {
+	write := project(t)
+	write("a.go", "package a\n\nfunc A() {}\n\nfunc B() {}\n")
+	write("über.py", "def über_limit():\n    return 1\n\nxlimit = 1\n")
+	out, _ := seek(t, "-c", "^$", "a.go")
+	expect(t, out, "2 hits in 1 file", "L2, 4")
+	out, _ = seek(t, "-c", "$", "a.go")
+	expect(t, out, "5 hits in 1 file") // not 6: no line after the last line break
+	out, _ = seek(t, "^func", "a.go")
+	expect(t, out, "2 hits in 1 file")
+	out, _ = seek(t, "ber_limit")
+	expect(t, out, "no hits", "über_limit  1 hit, defined at über.py:1 (def)")
+	out, _ = seek(t, "-d", "über_limit")
+	expect(t, out, "über.py:1-2  def über_limit():")
+	if _, code := seek(t, "-g", "[", "limit"); code != 2 {
+		t.Errorf("an unclosed [ in a glob is an error")
+	}
+	out, _ = seek(t, "-l", "-g", "*.[gp][oy]", "-g", "!*.p[!o]", "func|def")
+	if out != "a.go\n" {
+		t.Errorf("glob classes: %q", out)
+	}
 }

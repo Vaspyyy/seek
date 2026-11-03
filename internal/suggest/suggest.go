@@ -22,7 +22,7 @@ type Name struct {
 	score int
 }
 
-var tokenRe = regexp.MustCompile(`[A-Za-z_$][\w$]*`)
+var tokenRe = regexp.MustCompile(`[\p{L}_$][\p{L}\p{N}_$]*`)
 
 type stat struct {
 	count int
