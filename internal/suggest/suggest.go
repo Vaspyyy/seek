@@ -56,6 +56,9 @@ func Similar(words []string, paths []string, limit int) []Name {
 	return out[:min(len(out), limit)]
 }
 
+// Score is how alike the name is to the one searched for (lower is closer).
+func (n Name) Score() int { return n.score }
+
 // tokens counts the identifiers in paths and where they occur.
 func tokens(paths []string) map[string]*stat {
 	var mu sync.Mutex
@@ -138,18 +141,26 @@ func score(q, tok string) int {
 		return 4
 	case len(q) >= 4 && strings.Contains(lt, lq) && len(tok) <= 3*len(q):
 		return 5
-	case len(tok) >= 5 && strings.Contains(lq, lt) && 2*len(tok) >= len(q):
+	case len(tok) >= 5 && strings.Contains(lq, lt) && 5*len(tok) >= 3*len(q):
 		return 6
 	case renamed(parts(q), parts(tok)):
 		return 7
+	case sameVerb(parts(q), parts(tok)):
+		return 8
 	}
 	return 0
 }
 
+// sameVerb: both names have several parts and start with the same one
+// (save_project and save_settings).
+func sameVerb(q, t []string) bool {
+	return len(q) >= 2 && len(t) >= 2 && q[0] == t[0] && len(q[0]) >= 3
+}
+
 // renamed: the names differ in one part, not the last (rebuildFrontlineField
-// and invalidateFrontlineField).
+// and invalidateFrontlineField, save_project and load_project).
 func renamed(q, t []string) bool {
-	if len(q) < 3 || len(t) < 3 || q[len(q)-1] != t[len(t)-1] {
+	if len(q) < 2 || len(t) < 2 || q[len(q)-1] != t[len(t)-1] {
 		return false
 	}
 	shared := 0

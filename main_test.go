@@ -243,6 +243,11 @@ func TestNoHitsHints(t *testing.T) {
 	write("world.js", "export function invalidateFrontlineField() {}\n")
 	out, _ = seek(t, `function\s+rebuildFrontlineField\(`)
 	expect(t, out, "invalidateFrontlineField  1 hit, defined at world.js:1 (function)")
+	// a two-part name: the same noun with another verb, the same verb; not just its parts
+	write("proj.py", "def load_project(p):\n    pass\n\ndef save_settings(s):\n    pass\n\nproject = None\n")
+	out, _ = seek(t, "save_project")
+	expect(t, out, "load_project  1 hit, defined at proj.py:1 (def)", "save_settings  1 hit, defined at proj.py:4 (def)")
+	reject(t, out, "    project  ")
 }
 
 func TestPatterns(t *testing.T) {

@@ -392,15 +392,32 @@ func hints(out *bufio.Writer, o options, p *search.Pattern, paths []string) {
 	if len(p.Names) == 0 {
 		return
 	}
-	names := suggest.Similar(p.Names, paths, 8)
+	names := suggest.Similar(p.Names, paths, 20)
 	if len(names) == 0 {
 		return
 	}
-	fmt.Fprintln(out, "  similar names:")
+	// among equally similar names, defined ones first
+	type cand struct {
+		n     suggest.Name
+		def   string
+		score int
+	}
+	var cs []cand
 	for _, n := range names {
+		cs = append(cs, cand{n: n, def: firstDef(n.Word, n.Paths), score: n.Score()})
+	}
+	sort.SliceStable(cs, func(i, j int) bool {
+		if cs[i].score != cs[j].score {
+			return cs[i].score < cs[j].score
+		}
+		return cs[i].def != "" && cs[j].def == ""
+	})
+	fmt.Fprintln(out, "  similar names:")
+	for _, c := range cs[:min(len(cs), 8)] {
+		n := c.n
 		where := n.Paths[0]
-		if d := firstDef(n.Word, n.Paths); d != "" {
-			where = "defined at " + d
+		if c.def != "" {
+			where = "defined at " + c.def
 		} else if len(n.Paths) > 1 {
 			where = fmt.Sprintf("in %s, e.g. %s", plural(len(n.Paths), "file"), n.Paths[0])
 		}
