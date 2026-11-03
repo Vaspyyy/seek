@@ -528,3 +528,15 @@ func TestJavaScriptCallbacks(t *testing.T) {
 	out, _ := seek(t, "field")
 	expect(t, out, "  function _worker.onmessage  L1-4", "  method field  L6-8")
 }
+
+// -s doesn't print a nested definition a second time inside the one
+// around it (found while recording the preview).
+func TestBodiesDontRepeatNested(t *testing.T) {
+	write := project(t)
+	write("u.js", "export function make(world) {\n\tfunction should(unit) {\n\t\treturn unit.x > 1;\n\t}\n\n\tfunction step(unit) {\n\t\tif (should(unit)) {\n\t\t\tunit.x = 0;\n\t\t}\n\t}\n\n\treturn { step, should };\n}\n")
+	out, _ := seek(t, "-s", "should")
+	if n := strings.Count(out, "return unit.x > 1;"); n != 1 {
+		t.Errorf("printed %d times:\n%s", n, out)
+	}
+	expect(t, out, "  function make  L1-13\n     1- export function make(world) {\n     …\n     9- \t\t}\n    10- \t}\n    11-\n    12: \treturn { step, should };")
+}

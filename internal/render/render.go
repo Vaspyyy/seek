@@ -307,7 +307,7 @@ func (w *writer) file(f *group.File, lv int) {
 				}
 				w.line("%s%s%*d%s%s %s", ind, c.faint, width, l.n, sep(':', lv, w.o.Context), c.reset, text)
 			} else {
-				w.line("%s%s%*d%s%s %s", ind, c.faint, width, l.n, sep('-', lv, w.o.Context), c.reset, clipLine(text, 300))
+				w.line("%s", strings.TrimRight(fmt.Sprintf("%s%s%*d%s%s %s", ind, c.faint, width, l.n, sep('-', lv, w.o.Context), c.reset, clipLine(text, 300)), " "))
 			}
 		}
 	}
@@ -472,6 +472,14 @@ func (w *writer) window(f *group.File, g *group.Group, mode int) []shownLine {
 	lines := splitLines(f.Data)
 	want := map[int]bool{}
 	first := g.First() // a hit in the doc comment above: start there
+	if mode == 2 {
+		for _, o := range f.Groups {
+			if o != g && o.Sym >= 0 && g.Sym >= 0 && o.First() > g.Line && o.End <= g.End {
+				mode = 1 // it contains other shown definitions: don't print them twice
+				break
+			}
+		}
+	}
 	if mode == 2 && g.Sym >= 0 && g.End-first+1 <= bodyMax {
 		for n := first; n <= g.End; n++ {
 			want[n] = true
