@@ -19,16 +19,19 @@ import (
 // Pattern is a compiled search pattern.
 type Pattern struct {
 	Re    *regexp.Regexp
-	file  *regexp.Regexp  // Re for a whole file: ^ and $ at every line
-	Words []string        // the identifiers searched for, if the pattern is a list of them
-	Names []string        // identifiers in the pattern, also in a regex (for suggestions)
-	Smart bool            // whole words only, because the pattern is a list of identifiers
-	Text  bool            // searched as plain text (-F, or not a valid regex)
-	Fold  bool            // case-insensitive
-	Bad   string          // why the pattern was taken as text, if it wasn't a valid regex
-	Expr  string          // what the user typed
-	need  [][]byte        // a match contains one of these (nil: no such literal)
-	words map[string]bool // many whole words: found by splitting lines into words
+	file  *regexp.Regexp // Re for a whole file: ^ and $ at every line
+	Words []string       // the identifiers searched for, if the pattern is a list of them
+	Names []string       // identifiers in the pattern, also in a regex (for suggestions)
+	Smart bool           // whole words only, because the pattern is a list of identifiers
+	Text  bool           // searched as plain text (-F, or not a valid regex)
+	Fold  bool           // case-insensitive
+	Bad   string         // why the pattern was taken as text, if it wasn't a valid regex
+	Expr  string         // what the user typed
+	// DefMode: looking for definitions (-d); with a regex, a match anywhere
+	// on a definition's first line finds it
+	DefMode bool
+	need    [][]byte        // a match contains one of these (nil: no such literal)
+	words   map[string]bool // many whole words: found by splitting lines into words
 }
 
 // Options say how to read a pattern.

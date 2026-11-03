@@ -29,10 +29,15 @@ var skipDirs = map[string]bool{
 	".idea": true, ".cache": true, "dist": true, "build": true, ".next": true, ".godot": true,
 }
 
+// Nested lists the repositories inside the searched ones that List left
+// out (git doesn't list their files); set by List.
+var Nested []string
+
 // List returns the files below roots (files or directories), as paths
 // joined to the root they were found under, sorted. Roots that are files
 // are always included.
 func List(roots []string, o Options) ([]string, error) {
+	Nested = nil
 	if len(roots) == 0 {
 		roots = []string{"."}
 	}
@@ -71,8 +76,12 @@ func walk(root string, o Options, add func(string, bool)) error {
 	if !o.Unrestrict {
 		if ps, ok := gitFiles(root); ok {
 			for _, p := range ps {
-				if st, err := os.Lstat(filepath.Join(root, p)); err == nil && st.Mode().IsRegular() {
+				st, err := os.Lstat(filepath.Join(root, p))
+				switch {
+				case err == nil && st.Mode().IsRegular():
 					add(filepath.Join(root, p), false)
+				case err == nil && st.IsDir() && strings.HasSuffix(p, "/"):
+					Nested = append(Nested, filepath.Join(root, p)+"/") // an untracked repository
 				}
 			}
 			return nil

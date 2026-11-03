@@ -4,6 +4,7 @@
 package render
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"path"
@@ -45,6 +46,7 @@ func Rank(f *group.File) int {
 	case strings.HasSuffix(p, ".md") || strings.HasSuffix(p, ".txt") || strings.HasSuffix(p, ".rst") || strings.HasPrefix(base, "changelog"):
 		return 3
 	case strings.HasSuffix(base, "_test.go") || strings.HasPrefix(base, "test_") || strings.Contains(base, ".test.") ||
+		strings.Contains(base, "smoke") || strings.Contains(base, "bench") || strings.Contains("/"+p, "/e2e/") ||
 		strings.Contains(base, ".spec.") || strings.Contains("/"+p, "/tests/") || strings.Contains("/"+p, "/test/") || strings.HasSuffix(base, "_test.py"):
 		return 2
 	case !f.Outlined && dataExt[strings.TrimPrefix(path.Ext(base), ".")]:
@@ -85,6 +87,30 @@ type Layout struct {
 	level []int // per shown file: 1 one line, 2 a line per definition, 3 hit lines, 4 whole definitions
 }
 
+// Reduced counts the shown files that didn't get what -s or -C asked for
+// (whole definitions, context lines), of all shown files that could have.
+func (l *Layout) Reduced(files []*group.File, o Options) (reduced, total int) {
+	want := 0
+	switch {
+	case o.Bodies:
+		want = 5
+	case o.Context > 0 && !o.Counts:
+		want = 3
+	default:
+		return 0, 0
+	}
+	for i, lv := range l.level {
+		if files[i].Kind != "" {
+			continue
+		}
+		total++
+		if lv < want {
+			reduced++
+		}
+	}
+	return reduced, total
+}
+
 // Visible reports whether file i's definitions can be seen in the output.
 func (l *Layout) Visible(i int, f *group.File) bool {
 	return i < len(l.level) && (l.level[i] >= 3 || l.level[i] == 2 && f.Outlined)
@@ -114,16 +140,42 @@ func Plan(files []*group.File, o Options) *Layout {
 	if o.Counts {
 		top = 2
 	} else if o.Bodies {
-		top = 4
+		top = 5
 	}
-	for lv := 2; lv <= top; lv++ {
+	for lv := 2; lv <= min(top, 3); lv++ {
 		for i := range level {
 			if files[i].Kind != "" || level[i] != lv-1 {
 				continue // lock, generated and vendored files stay on one line
 			}
+			if lv == 3 && top == 5 {
+				// -s: whole definitions for the first files that fit, in order,
+				// else the lines around their hits, rather than hit lines for all
+				for _, want := range []int{5, 4} {
+					if d := cost(i, want) - cost(i, level[i]); d <= room {
+						room -= d
+						level[i] = want
+						break
+					}
+				}
+				if level[i] >= 4 {
+					continue
+				}
+			}
 			if d := cost(i, lv) - cost(i, level[i]); d <= room {
 				room -= d
 				level[i] = lv
+			}
+		}
+	}
+	if top == 5 { // what's left: more code for files that got less
+		for _, want := range []int{4, 5} {
+			for i := range level {
+				if level[i] >= 3 && level[i] < want {
+					if d := cost(i, want) - cost(i, level[i]); d <= room {
+						room -= d
+						level[i] = want
+					}
+				}
 			}
 		}
 	}
@@ -155,7 +207,8 @@ func Print(out io.Writer, files []*group.File, l *Layout, o Options) {
 }
 
 // cost is how many lines a file takes at a level (1: one line, 2: a line
-// per definition, 3: hit lines, 4: whole definitions).
+// per definition, 3: hit lines, 4: lines around each hit, 5: whole
+// definitions, or the lines around the hits in long ones).
 func (w *writer) cost(f *group.File, lv int) int {
 	switch lv {
 	case 0, 1:
@@ -171,7 +224,7 @@ func (w *writer) cost(f *group.File, lv int) int {
 			if f.Outlined {
 				n++
 			}
-			n += len(w.window(f, g, false))
+			n += len(w.window(f, g, 0))
 		}
 		return n
 	}
@@ -180,7 +233,7 @@ func (w *writer) cost(f *group.File, lv int) int {
 		if f.Outlined {
 			n++
 		}
-		n += len(w.window(f, g, true))
+		n += len(w.window(f, g, lv-3))
 	}
 	return n
 }
@@ -188,7 +241,7 @@ func (w *writer) cost(f *group.File, lv int) int {
 func (w *writer) file(f *group.File, lv int) {
 	c := w.c
 	n := f.Count()
-	desc := []string{plural(f.Lines, "line")}
+	desc := []string{plural(f.Lines, "line") + crlf(f)}
 	if f.Kind != "" {
 		desc = append(desc, f.Kind)
 	}
@@ -228,7 +281,7 @@ func (w *writer) file(f *group.File, lv int) {
 		return
 	}
 	// the hit lines follow: they show the labels themselves
-	w.line("%s%s%s  %s", c.path, f.Path, c.reset, plural(f.Lines, "line"))
+	w.line("%s%s%s  %s%s", c.path, f.Path, c.reset, plural(f.Lines, "line"), crlf(f))
 	width := len(strconv.Itoa(lastLine(f)))
 	for _, g := range f.Groups {
 		ind := "  "
@@ -240,14 +293,15 @@ func (w *writer) file(f *group.File, lv int) {
 			w.line("  %s", w.groupHead(g))
 			ind = "    "
 		}
-		for _, l := range w.window(f, g, lv == 4) {
+		common := commonIndent(g)
+		for _, l := range w.window(f, g, lv-3) {
 			if l.gap {
 				w.line("%s%s%s…%s", ind, c.faint, strings.Repeat(" ", width-1), c.reset)
 				continue
 			}
 			text := l.text
 			if l.hit != nil {
-				text = w.highlight(*l.hit, lv == 4 || w.o.Context > 0)
+				text = w.highlight(*l.hit, lv >= 4 || w.o.Context > 0, common)
 				if shownLabel[l.hit.Label] {
 					text += "  " + c.label + "(" + l.hit.Label + ")" + c.reset
 				}
@@ -263,11 +317,37 @@ func (w *writer) file(f *group.File, lv int) {
 // declaration, assignment) are plain from the line itself.
 var shownLabel = map[string]bool{"comment": true, "string": true}
 
+// commonIndent is the leading whitespace all of a group's hit lines share.
+func commonIndent(g *group.Group) string {
+	var common string
+	for k, h := range g.Hits {
+		ind := h.Text[:len(h.Text)-len(strings.TrimLeft(h.Text, " \t"))]
+		if k == 0 {
+			common = ind
+			continue
+		}
+		n := 0
+		for n < len(common) && n < len(ind) && common[n] == ind[n] {
+			n++
+		}
+		common = common[:n]
+	}
+	return common
+}
+
 // sep is grep's marker after a line number (":" for hits, "-" for
 // context), shown only when there are context lines to tell apart.
 func sep(ch byte, lv, ctx int) string {
-	if lv == 4 || ctx > 0 {
+	if lv >= 4 || ctx > 0 {
 		return string(ch)
+	}
+	return ""
+}
+
+// crlf notes Windows line endings, which the shown text leaves out.
+func crlf(f *group.File) string {
+	if bytes.Contains(f.Data, []byte("\r\n")) {
+		return ", CRLF line endings"
 	}
 	return ""
 }
@@ -290,8 +370,8 @@ func (w *writer) groupHead(g *group.Group) string {
 	if g.Sym < 0 {
 		return c.faint + "(top level)" + c.reset
 	}
-	rng := "L" + strconv.Itoa(g.Line)
-	if g.End > g.Line {
+	rng := "L" + strconv.Itoa(g.First())
+	if g.End > g.First() {
 		rng += "-" + strconv.Itoa(g.End)
 	}
 	return fmt.Sprintf("%s %s%s%s  %s", g.Kind, c.sym, g.Name, c.reset, rng)
@@ -374,13 +454,15 @@ const bodyMax = 80
 
 // window is the lines a group shows: its hits (with -C context), or with
 // whole set its whole definition (or windows around the hits).
-func (w *writer) window(f *group.File, g *group.Group, whole bool) []shownLine {
+// mode 0: the hits (with -C context); 1: lines around each hit and the
+// definition's first line; 2: the whole definition if it's short, else as 1.
+func (w *writer) window(f *group.File, g *group.Group, mode int) []shownLine {
 	ctx := w.o.Context
 	hits := map[int]*group.Hit{}
 	for i := range g.Hits {
 		hits[g.Hits[i].Line] = &g.Hits[i]
 	}
-	if !whole && ctx == 0 {
+	if mode == 0 && ctx == 0 {
 		var out []shownLine
 		for i := range g.Hits {
 			out = append(out, shownLine{n: g.Hits[i].Line, hit: &g.Hits[i]})
@@ -389,18 +471,13 @@ func (w *writer) window(f *group.File, g *group.Group, whole bool) []shownLine {
 	}
 	lines := splitLines(f.Data)
 	want := map[int]bool{}
-	first := g.Line // a hit in the doc comment above: start there
-	for _, h := range g.Hits {
-		if g.Sym >= 0 && h.Line < first {
-			first = h.Line
-		}
-	}
-	if whole && g.Sym >= 0 && g.End-first+1 <= bodyMax {
+	first := g.First() // a hit in the doc comment above: start there
+	if mode == 2 && g.Sym >= 0 && g.End-first+1 <= bodyMax {
 		for n := first; n <= g.End; n++ {
 			want[n] = true
 		}
 	} else {
-		if whole {
+		if mode >= 1 {
 			ctx = max(ctx, 3)
 			if g.Sym >= 0 {
 				want[g.Line] = true
@@ -408,7 +485,7 @@ func (w *writer) window(f *group.File, g *group.Group, whole bool) []shownLine {
 		}
 		for _, h := range g.Hits {
 			for n := h.Line - ctx; n <= h.Line+ctx; n++ {
-				if n >= 1 && n <= len(lines) && (g.Sym < 0 || n >= first && n <= g.End || !whole) {
+				if n >= 1 && n <= len(lines) && (g.Sym < 0 || n >= first && n <= g.End || mode == 0) {
 					want[n] = true
 				}
 			}
@@ -428,7 +505,7 @@ func (w *writer) window(f *group.File, g *group.Group, whole bool) []shownLine {
 		}
 		out = append(out, shownLine{n: n, text: lines[n-1], hit: hits[n]})
 	}
-	if whole && g.Sym >= 0 && len(ns) > 0 && ns[len(ns)-1] < g.End {
+	if mode >= 1 && g.Sym >= 0 && len(ns) > 0 && ns[len(ns)-1] < g.End {
 		out = append(out, shownLine{gap: true}) // the definition goes on
 	}
 	return out
@@ -442,14 +519,17 @@ func splitLines(data []byte) []string {
 
 // highlight prints a hit line with its matches marked, clipped around the
 // first match if it's long. raw keeps its indentation.
-func (w *writer) highlight(h group.Hit, raw bool) string {
+func (w *writer) highlight(h group.Hit, raw bool, common string) string {
 	text := h.Text
 	spans := h.Spans
 	if !raw {
-		trimmed := strings.TrimLeft(text, " \t")
-		cut := len(text) - len(trimmed)
-		text = strings.TrimRight(trimmed, " \t")
-		spans = shift(spans, -cut, len(text))
+		// the indentation the group's lines share goes; the rest shows nesting
+		rest := strings.TrimPrefix(text, common)
+		body := strings.TrimLeft(rest, " \t")
+		lead := strings.ReplaceAll(rest[:len(rest)-len(body)], "\t", "  ")
+		cut := len(text) - len(body)
+		text = lead + strings.TrimRight(body, " \t")
+		spans = shift(spans, len(lead)-cut, len(text))
 	}
 	const maxLen = 160
 	if len(text) > maxLen && len(spans) > 0 {

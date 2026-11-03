@@ -126,10 +126,10 @@ func TestGroupsAndLabels(t *testing.T) {
 	expect(t, out,
 		`seek: "Open" (whole word): 5 hits in 1 file`+"\n",
 		"shop/repo.go  23 lines\n",
-		"  func Repo.Open  L11-18\n    10 // Open opens a repository.  (comment)\n    11 func",
+		"  func Repo.Open  L10-18\n    10 // Open opens a repository.  (comment)\n    11 func",
 		"    11 func (r *Repo) Open(path string) error {\n",
-		"    14 _ = strings.TrimSpace(path) // Open is fine  (comment)",
-		`    15 msg := "Open failed"  (string)`,
+		"    14   _ = strings.TrimSpace(path) // Open is fine  (comment)",
+		`    15   msg := "Open failed"  (string)`,
 		"  func use  L20-23",
 		`    22 r.Open("x")`,
 	)
@@ -234,8 +234,7 @@ func TestNoHitsHints(t *testing.T) {
 	if code != 1 {
 		t.Errorf("exit %d", code)
 	}
-	expect(t, out, "no hits", "load_map  1 hit, defined at map.js:2 (function)", "loadWorldMap  1 hit, defined at map.js:1 (function)",
-)
+	expect(t, out, "no hits", "load_map  1 hit, defined at map.js:2 (function)", "loadWorldMap  1 hit, defined at map.js:1 (function)")
 	reject(t, out, "LoadMapper") // much less alike than load_map: not shown
 	out, _ = seek(t, "rebuildfrontline")
 	expect(t, out, "ignoring case: 1 hit in 1 file (rebuildFrontline): seek -i rebuildfrontline")
@@ -260,7 +259,8 @@ func TestPatterns(t *testing.T) {
 	out, _ = seek(t, "$scope")
 	expect(t, out, "1 const $scope = 1;\n")
 	out, _ = seek(t, "speed")
-	reject(t, out, "speedMult")
+	reject(t, out, "3 speedMult")
+	expect(t, out, "+1 more hit inside longer words (speedMult 1): seek --partial speed")
 	out, _ = seek(t, "--partial", "speed")
 	expect(t, out, "3 speedMult = 2;\n")
 	out, _ = seek(t, "colou?r")
@@ -366,7 +366,7 @@ func TestBodyIncludesDocCommentHit(t *testing.T) {
 	write := project(t)
 	write("a.rs", "/// The label is yellow.\nfn label() -> u32 {\n    1\n}\n")
 	out, _ := seek(t, "-s", "yellow")
-	expect(t, out, "  fn label  L2-4\n    1: /// The label is yellow.  (comment)\n    2- fn label() -> u32 {")
+	expect(t, out, "  fn label  L1-4\n    1: /// The label is yellow.  (comment)\n    2- fn label() -> u32 {")
 }
 
 // A pattern of thousands of names finishes quickly, and the header doesn't
@@ -414,4 +414,117 @@ func TestFirstRoundPatterns(t *testing.T) {
 	if out != "a.go\n" {
 		t.Errorf("glob classes: %q", out)
 	}
+}
+
+// Labels, from the first review round: code inside interpolations, char
+// literals, a code hit after a string, block comments over several lines.
+func TestFirstRoundLabels(t *testing.T) {
+	write := project(t)
+	write("a.ts", "const url = `https://x/${getCode(c)}.webp`;\nconst msg = `getCode is ${n}`;\nconst u = \"getCode\"; getCode();\n/*\n getCode was renamed\n*/\nfunction getCode(c) { return c; }\n")
+	write("m.py", "class Cart:\n    limit = 1\n\n    def label(self):\n        return f\"{self.limit} items\"\n")
+	write("r.rs", "fn f() {\n    let q = '\"'; let v = target;\n}\n")
+	out, _ := seek(t, "getCode")
+	expect(t, out, "1 const url = `https://x/${getCode(c)}.webp`;\n", "2 const msg = `getCode is ${n}`;  (string)",
+		"3 const u = \"getCode\"; getCode();\n", "  function getCode  L4-7\n    5  getCode was renamed  (comment)")
+	out, _ = seek(t, "limit", "m.py")
+	expect(t, out, "5 return f\"{self.limit} items\"\n")
+	out, _ = seek(t, "target", "r.rs")
+	expect(t, out, "let v = target;\n")
+}
+
+// -d, from the first review round.
+func TestFirstRoundDefinitions(t *testing.T) {
+	write := project(t)
+	write("V.java", "class Oracle {\n    private final Sampler sampler;\n    public Sampler compileSampler(int x) {\n        return sampler;\n    }\n}\n")
+	write("e.rs", "impl fmt::Display for DecodeError {\n    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {\n        Ok(())\n    }\n}\n")
+	write("guide.md", "# Guide\n\n```go\nfunc limitOf() int { return 10 }\n```\n")
+	write("settings.py", "class AppSettings:\n    recent_projects: list = []\n\n\ndef load_settings():\n    pass\n")
+	write("vendor/lib/x.go", "package lib\n\nfunc Vendored() {}\n")
+	write("main.js", "const { performTick } = createTick();\nexport function createTick() {\n\tfunction performTick() {}\n\treturn { performTick };\n}\n")
+	out, _ := seek(t, "-d", "Sampler|sampler|compileSampler")
+	expect(t, out, "V.java:2  private final Sampler sampler;", "V.java:3-5  public Sampler compileSampler(int x)")
+	reject(t, out, "3 definitions") // the types in the field and the method aren't definitions of Sampler
+	out, _ = seek(t, "-d", "fmt")
+	expect(t, out, "1 definition", "e.rs:2-4  fn fmt(")
+	out, _ = seek(t, "-d", "impl.*Display for")
+	expect(t, out, "e.rs:1-5  impl fmt::Display for DecodeError")
+	out, _ = seek(t, "-d", "limitOf")
+	expect(t, out, "no definition found")
+	out, _ = seek(t, "-d", "--partial", "recent")
+	expect(t, out, "settings.py:2  recent_projects: list = []")
+	out, _ = seek(t, "-d", "Vendored")
+	expect(t, out, "vendor/lib/x.go:3  func Vendored()  (vendored)")
+	out, _ = seek(t, "-d", "load")
+	expect(t, out, "no definition found", "definitions containing it: load_settings (settings.py:5): seek -d --partial load")
+	out, _ = seek(t, "-d", "Nope.performTick")
+	expect(t, out, "seek -d: \"Nope.performTick\"", "seek performTick lists them")
+	out, _ = seek(t, "-d", "performTick")
+	expect(t, out, "main.js:3  function performTick()")
+	reject(t, out, "main.js:1") // destructuring binds, it doesn't define
+}
+
+// Output, from the first review round: what the budget and whole words
+// leave out, CRLF, ranking, skipped files, flags.
+func TestFirstRoundOutput(t *testing.T) {
+	write := project(t)
+	var b strings.Builder
+	b.WriteString("package big\n\n")
+	for i := 0; i < 6; i++ {
+		b.WriteString("func f" + itoa(i) + "() {\n")
+		for k := 0; k < 30; k++ {
+			b.WriteString("\tx()\n")
+		}
+		b.WriteString("\tretreat()\n\tretreatVector()\n}\n\n")
+	}
+	write("big.go", b.String())
+	write("crlf.py", "def windows():\r\n    return retreat\r\n")
+	write("scripts/retreat-smoke.mjs", "retreat();\n")
+	write("src/ai.js", "export function plan() {\n  retreat();\n}\n")
+	write("blob.txt", "retreat\x00binary\n")
+	out, _ := seek(t, "retreat")
+	expect(t, out, "+6 more hits inside longer words (retreatVector 6): seek --partial retreat", "crlf.py  2 lines, CRLF line endings")
+	if strings.Index(out, "src/ai.js") > strings.Index(out, "scripts/retreat-smoke.mjs") {
+		t.Errorf("smoke scripts rank after source:\n%s", out)
+	}
+	out, _ = seek(t, "-s", "-b", "40", "retreat", "big.go")
+	expect(t, out, "1 of 1 file with less than their whole definitions, to stay within the budget")
+	out, _ = seek(t, "-s", "-b", "90", "retreat", "big.go")
+	expect(t, out, "      3- func f0() {\n      …\n     31- \tx()", "1 of 1 file with less than their whole definitions")
+	out, _ = seek(t, "retreat", "blob.txt")
+	expect(t, out, "not searched: blob.txt is binary")
+	out, code := seek(t, "-retreat")
+	if code != 2 || !strings.Contains(out, "seek -e -retreat") {
+		t.Errorf("a pattern starting with - should point to -e: %d %s", code, out)
+	}
+	out, _ = seek(t, "-l", "-0", "plan")
+	if out != "src/ai.js\x00" {
+		t.Errorf("-l -0: %q", out)
+	}
+	write("twice.js", "retreatX(); retreatX();\n")
+	out, _ = seek(t, "retreatXY")
+	expect(t, out, "retreatX  1 hit") // lines, like the search counts
+}
+
+// A nested repository isn't searched; when nothing matches, seek says so.
+func TestNestedRepositoryNote(t *testing.T) {
+	write := project(t)
+	write("a.go", "package a\n")
+	gitInit(t)
+	write("sub/inner.go", "package inner\n\nfunc innerOnly() {}\n")
+	cmd := exec.Command("git", "init", "-q", "sub")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%s", out)
+	}
+	out, _ := seek(t, "innerOnly")
+	expect(t, out, "no hits", "not searched: 1 repository inside: sub/ (give it as a path to search it)")
+	out, _ = seek(t, "innerOnly", "sub")
+	expect(t, out, "1 hit in 1 file")
+}
+
+// Code in callbacks and setter objects belongs to them, not to the top level.
+func TestJavaScriptCallbacks(t *testing.T) {
+	write := project(t)
+	write("w.js", "_worker.onmessage = (evt) => {\n\tconst field = evt.data;\n\tuse(field);\n};\nconst setters = {\n\tfield: (v) => {\n\t\tfield = v;\n\t},\n};\n")
+	out, _ := seek(t, "field")
+	expect(t, out, "  function _worker.onmessage  L1-4", "  method field  L6-8")
 }

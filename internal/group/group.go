@@ -27,7 +27,16 @@ type Group struct {
 	Name      string // qualified: Type.method
 	Sig       string
 	Line, End int
+	Doc       int // first line of its doc comment, when a hit is in it (else 0)
 	Hits      []Hit
+}
+
+// First is the first line to read: the doc comment's if a hit is in it.
+func (g *Group) First() int {
+	if g.Doc > 0 && g.Doc < g.Line {
+		return g.Doc
+	}
+	return g.Line
 }
 
 // File is a searched file with its hits grouped.
@@ -83,7 +92,7 @@ func Build(f *search.File, p *search.Pattern) *File {
 		// definitions the outline found inside a docstring or a template aren't real
 		var keep []outline.Symbol
 		for _, s := range out.Syms {
-			if !inText[s.Line] {
+			if inText[s.Line] == "" {
 				keep = append(keep, s)
 			}
 		}
@@ -93,24 +102,36 @@ func Build(f *search.File, p *search.Pattern) *File {
 	}
 	for _, h := range f.Hits {
 		si := innermost(out.Syms, h.Line)
-		if inText[h.Line] {
+		if l := inText[h.Line]; l != "" {
+			if l == "comment" && len(out.Syms) > 0 {
+				if lines == nil {
+					lines = strings.Split(string(f.Data), "\n")
+				}
+				if d := docOf(out.Syms, si, h.Line, lines, st, inText); d >= 0 {
+					si = d // in the doc comment of the definition below
+				}
+			}
 			g := groupFor(out, byKey, si)
-			g.Hits = append(g.Hits, Hit{Hit: h, Label: "string"})
+			g.Hits = append(g.Hits, Hit{Hit: h, Label: l})
 			continue
 		}
-		if len(out.Syms) > 0 && commentLine(h.Text, st) {
+		if len(out.Syms) > 0 && (commentLine(h.Text, st) || decorator(h.Text)) {
 			if lines == nil {
 				lines = strings.Split(string(f.Data), "\n")
 			}
-			if d := docOf(out.Syms, si, h.Line, lines, st); d >= 0 {
+			if d := docOf(out.Syms, si, h.Line, lines, st, inText); d >= 0 {
 				si = d // a doc comment belongs to the definition below it
 			}
 		}
 		g := groupFor(out, byKey, si)
 		hit := Hit{Hit: h}
-		if si >= 0 && isField(out.Syms[si], h) {
+		field := ""
+		if si >= 0 {
+			field = isField(out.Syms[si], h, st.typed)
+		}
+		if field != "" {
 			hit.Label = "definition"
-			out.Defs = append(out.Defs, Def{Kind: "field", Name: g.Name + "." + h.Text[h.Spans[0][0]:h.Spans[0][1]],
+			out.Defs = append(out.Defs, Def{Kind: "field", Name: g.Name + "." + field,
 				Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line})
 		} else if si >= 0 && isDef(out.Syms[si], h, p) {
 			hit.Label = "definition"
@@ -126,6 +147,24 @@ func Build(f *search.File, p *search.Pattern) *File {
 		}
 		g.Hits = append(g.Hits, hit)
 	}
+	// a hit in a doc comment: the group starts where the comment does
+	for _, g := range out.Groups {
+		if g.Sym < 0 {
+			continue
+		}
+		for _, h := range g.Hits {
+			if h.Line < g.Line {
+				if lines == nil {
+					lines = strings.Split(string(f.Data), "\n")
+				}
+				g.Doc = h.Line
+				for k := h.Line - 1; k >= 1 && k <= len(lines) && (commentLine(lines[k-1], st) || decorator(lines[k-1]) || inText[k] == "comment" || strings.HasPrefix(strings.TrimSpace(lines[k-1]), "/*")); k-- {
+					g.Doc = k
+				}
+				break
+			}
+		}
+	}
 	// top level first, then by line
 	for i, g := range out.Groups {
 		if g.Sym < 0 && i > 0 {
@@ -140,7 +179,7 @@ func Build(f *search.File, p *search.Pattern) *File {
 // docOf is the definition that the comment on line n documents: the next
 // one, if only comment and decorator lines lie between them, and it's
 // inside the same definition as the comment. -1 if there's none.
-func docOf(syms []outline.Symbol, in, n int, lines []string, st style) int {
+func docOf(syms []outline.Symbol, in, n int, lines []string, st style, inText map[int]string) int {
 	for i, s := range syms {
 		if s.Line <= n {
 			continue
@@ -149,7 +188,7 @@ func docOf(syms []outline.Symbol, in, n int, lines []string, st style) int {
 			return -1
 		}
 		for k := n + 1; k < s.Line; k++ {
-			if k > len(lines) || !commentLine(lines[k-1], st) && !decorator(lines[k-1]) {
+			if k > len(lines) || !commentLine(lines[k-1], st) && !decorator(lines[k-1]) && inText[k] != "comment" {
 				return -1
 			}
 		}
@@ -179,11 +218,15 @@ func decorator(l string) bool {
 // topLevelDecl: a declaration (const x = …) or, in Python and other
 // languages without a keyword, an assignment at the start of an unindented line.
 func topLevelDecl(h search.Hit, label string, st style) bool {
+	if !st.code {
+		return false
+	}
 	switch label {
 	case "declaration":
-		return h.Text == strings.TrimLeft(h.Text, " \t")
+		// const { a } = b binds a name from something defined elsewhere
+		return h.Text == strings.TrimLeft(h.Text, " \t") && !strings.ContainsAny(h.Text[:h.Spans[0][0]], "{[")
 	case "assignment":
-		return st.line != nil && st.line[0] == "#" && h.Spans[0][0] == 0
+		return st.fstrings && h.Spans[0][0] == 0 // Python: NAME = … at module level
 	}
 	return false
 }
@@ -203,16 +246,6 @@ var (
 	fieldBefore = regexp.MustCompile(`^\s*(?:(?:pub(?:\([^)]*\))?|public|private|protected|internal|readonly|static|final|val|var|let|const|declare|override|abstract|mut|required|late)\s+)*$`)
 	fieldAfter  = regexp.MustCompile(`^(?:\s+[\w*\[\]<>.&(]|\s*[?!]?\s*:[^:]|\s*=[^=>]|\s*[,;]|\s*$|\s*\(|\s*\{)`)
 )
-
-// isField: the hit names a field, attribute, member or (in an interface) a
-// method of the type or class directly around it, at the start of its line.
-func isField(s outline.Symbol, h search.Hit) bool {
-	if !containers[s.Kind] || h.Line == s.Line || len(h.Spans) == 0 {
-		return false
-	}
-	a, b := h.Spans[0][0], h.Spans[0][1]
-	return fieldBefore.MatchString(h.Text[:a]) && fieldAfter.MatchString(h.Text[b:])
-}
 
 func groupFor(out *File, byKey map[int]*Group, si int) *Group {
 	g := byKey[si]
@@ -242,24 +275,29 @@ func reparent(syms []outline.Symbol) []outline.Symbol {
 	return syms
 }
 
-// multiline marks the lines inside strings that span lines: Python's
-// triple-quoted strings (docstrings), backtick strings in JavaScript,
-// TypeScript and Go. The opening line isn't marked (code may come
-// before the quotes); the lines after it up to the closing one are.
-func multiline(path string, data []byte) map[int]bool {
+// multiline labels the lines inside strings and comments that span lines:
+// Python's triple-quoted strings (docstrings), backtick strings in
+// JavaScript, TypeScript and Go, and /* … */ comments in C-like languages.
+// The opening line isn't labelled (code may come before the mark); the
+// lines after it up to the closing one are.
+func multiline(path string, data []byte) map[int]string {
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
-	py := ext == "py" || ext == "pyi"
-	var marks []string
-	switch {
-	case py:
-		marks = []string{`"""`, `'''`}
-	case ext == "js" || ext == "mjs" || ext == "cjs" || ext == "ts" || ext == "tsx" || ext == "jsx" || ext == "mts" || ext == "cts" || ext == "go":
-		marks = []string{"`"}
+	type mark struct{ open, close, label string }
+	block := mark{"/*", "*/", "comment"}
+	var marks []mark
+	hash := false
+	switch ext {
+	case "py", "pyi":
+		marks, hash = []mark{{`"""`, `"""`, "string"}, {`'''`, `'''`, "string"}}, true
+	case "js", "mjs", "cjs", "ts", "tsx", "jsx", "mts", "cts", "go":
+		marks = []mark{{"`", "`", "string"}, block}
+	case "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "java", "cs", "rs", "kt", "kts", "scala", "swift", "css", "scss", "less", "php", "dart", "zig", "glsl", "wgsl", "hlsl":
+		marks = []mark{block}
 	default:
 		return nil
 	}
-	var in map[int]bool
-	open := ""
+	var in map[int]string
+	var open *mark
 	n := 0
 	for len(data) > 0 {
 		n++
@@ -269,44 +307,44 @@ func multiline(path string, data []byte) map[int]bool {
 		} else {
 			data = nil
 		}
-		if open != "" {
+		if open != nil {
 			if in == nil {
-				in = map[int]bool{}
+				in = map[int]string{}
 			}
-			in[n] = true
+			in[n] = open.label
 		}
 		s := string(line)
 		for i := 0; i < len(s); {
-			if open != "" {
+			if open != nil {
 				switch {
-				case s[i] == '\\' && open == "`":
+				case s[i] == '\\' && open.open == "`":
 					i += 2
-				case strings.HasPrefix(s[i:], open):
-					i += len(open)
-					open = ""
+				case strings.HasPrefix(s[i:], open.close):
+					i += len(open.close)
+					open = nil
 				default:
 					i++
 				}
 				continue
 			}
-			if py && s[i] == '#' || !py && strings.HasPrefix(s[i:], "//") {
-				break // a comment
+			if hash && s[i] == '#' || !hash && strings.HasPrefix(s[i:], "//") {
+				break // a line comment
 			}
 			if s[i] == '\\' {
 				i += 2
 				continue
 			}
 			found := false
-			for _, m := range marks {
-				if strings.HasPrefix(s[i:], m) {
-					open, i, found = m, i+len(m), true
+			for k := range marks {
+				if strings.HasPrefix(s[i:], marks[k].open) {
+					open, i, found = &marks[k], i+len(marks[k].open), true
 					break
 				}
 			}
 			if found {
 				continue
 			}
-			if s[i] == '"' || s[i] == '\'' {
+			if s[i] == '"' || s[i] == '\'' && ext != "rs" {
 				// a one-line string: its quotes don't open anything
 				q, j := s[i], i+1
 				for j < len(s) && s[j] != q {
@@ -345,37 +383,24 @@ func lastPart(name string) string {
 	return name
 }
 
-// isDef: the hit is on the symbol's first line and matches its name.
-func isDef(s outline.Symbol, h search.Hit, p *search.Pattern) bool {
-	if h.Line != s.Line {
-		return false
-	}
-	name := lastPart(s.Name)
-	for _, sp := range h.Spans {
-		m := h.Text[sp[0]:sp[1]]
-		mm := lastPart(m)
-		if strings.EqualFold(mm, name) || !p.Smart && len(m) >= 3 && strings.Contains(strings.ToLower(name), strings.ToLower(m)) {
-			return true
-		}
-		if !p.Smart && strings.Contains(m, name) {
-			return true
-		}
-	}
-	return false
-}
-
 // how a language writes comments and strings
 type style struct {
-	line   []string // line comment markers
-	block  bool     // /* … */ (and "*" continuation lines)
-	quotes string
+	line     []string // line comment markers
+	block    bool     // /* … */ (and "*" continuation lines)
+	quotes   string
+	code     bool // source code (not data, docs or prose): keywords define names
+	typed    bool // declarations put the type before the name (Java, C#, C, C++)
+	fstrings bool // Python f-strings interpolate {…}
 }
 
 var (
-	slashStyle = style{line: []string{"//"}, block: true, quotes: "\"`"}
-	jsStyle    = style{line: []string{"//"}, block: true, quotes: "\"'`"}
-	hashStyle  = style{line: []string{"#"}, quotes: "\"'"}
-	dashStyle  = style{line: []string{"--"}, quotes: "\"'"}
+	slashStyle = style{line: []string{"//"}, block: true, quotes: "\"`", code: true}
+	typedStyle = style{line: []string{"//"}, block: true, quotes: "\"", code: true, typed: true}
+	jsStyle    = style{line: []string{"//"}, block: true, quotes: "\"'`", code: true}
+	hashStyle  = style{line: []string{"#"}, quotes: "\"'", code: true}
+	pyStyle    = style{line: []string{"#"}, quotes: "\"'", code: true, fstrings: true}
+	confStyle  = style{line: []string{"#"}, quotes: "\"'"} // YAML, TOML, INI: data
+	dashStyle  = style{line: []string{"--"}, quotes: "\"'", code: true}
 	cssStyle   = style{block: true, quotes: "\"'"}
 	plainStyle = style{} // data, Markdown, HTML: no string labels
 )
@@ -385,10 +410,18 @@ func styleOf(path string) style {
 	switch strings.TrimPrefix(filepath.Ext(base), ".") {
 	case "js", "mjs", "cjs", "ts", "tsx", "jsx", "mts", "cts", "svelte", "vue", "php", "dart":
 		return jsStyle
-	case "go", "rs", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "java", "kt", "kts", "cs", "scala", "swift", "zig", "proto", "glsl", "wgsl", "hlsl", "frag", "vert", "gdshader", "jsonc":
+	case "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "java", "cs":
+		return typedStyle
+	case "go", "rs", "kt", "kts", "scala", "swift", "zig", "proto", "glsl", "wgsl", "hlsl", "frag", "vert", "gdshader":
 		return slashStyle
-	case "py", "pyi", "sh", "bash", "zsh", "fish", "rb", "yaml", "yml", "toml", "gd", "r", "pl", "conf", "cfg", "ini", "mk", "cmake", "nix", "ps1", "tcl", "dockerfile":
+	case "py", "pyi":
+		return pyStyle
+	case "sh", "bash", "zsh", "fish", "rb", "gd", "r", "pl", "mk", "cmake", "nix", "ps1", "tcl", "dockerfile":
 		return hashStyle
+	case "yaml", "yml", "toml", "conf", "cfg", "ini":
+		return confStyle
+	case "jsonc":
+		return style{line: []string{"//"}, block: true}
 	case "lua", "sql", "hs", "elm", "ada":
 		return dashStyle
 	case "css", "scss", "less":
@@ -402,7 +435,7 @@ func styleOf(path string) style {
 }
 
 var (
-	defKeyword  = regexp.MustCompile(`(?:^|[\s(,])(?:function\*?|def|fn|func|class|struct|enum|interface|trait|type|module|namespace|macro_rules!|record|object|union|impl)\s+(?:<[^>]*>\s*)?(?:\([^)]*\)\s*)?[\w.]*$`)
+	defKeyword  = regexp.MustCompile(`(?:^|[\s(,])(?:function\*?|def|fn|func|class|struct|enum|interface|trait|type|module|namespace|macro_rules!|record|object|union)\s+(?:<[^>]*>\s*)?(?:\([^)]*\)\s*)?[\w.]*$`)
 	declKeyword = regexp.MustCompile(`(?:^|[\s(,{])(?:const|let|var|val|local|my|our|static|final|auto|mut|global|nonlocal|readonly)\s+(?:mut\s+|\*\s*|&\s*)*(?:[\w$]+\s*,\s*)*[\[{(]?\s*(?:[\w$]+\s*,\s*)*$`)
 	assignAfter = regexp.MustCompile(`^\s*(?:\[[^\]]*\]\s*)?(?:(?:[-+*/%&|^]|<<|>>|>>>|\?\?|\|\||&&|\*\*)?=(?:[^=>~]|$)|\+\+|--)`)
 	goDecl      = regexp.MustCompile(`^\s*(?:,\s*[\w$]+\s*)*:=`)
@@ -410,24 +443,40 @@ var (
 	importLine  = regexp.MustCompile(`^(?:import\b|from\s+\S+\s+import\b|use\s|#include\b|#import\b|require\(|(?:const|let|var)\s+.*=\s*require\(|export\s+\{[^}]*\}\s+from\b|export\s+\*\s+from\b|@import\b|extern\s+crate\b|using\s+[\w.]+;|package\s+[\w.]+;|load\(|preload\()`)
 )
 
-// classify labels a hit by its first match.
+// classify labels a hit. With several matches on the line, one in code
+// decides (a call after a string is still a call); only if all are in
+// comments or strings is the line labelled so.
 func classify(h search.Hit, st style) string {
 	if len(h.Spans) == 0 {
 		return ""
 	}
-	start, end := h.Spans[0][0], h.Spans[0][1]
-	before, after := h.Text[:start], h.Text[end:]
 	trimmed := strings.TrimSpace(h.Text)
-	if inComment(before, trimmed, st) {
-		return "comment"
+	first := ""
+	for k, sp := range h.Spans {
+		before := h.Text[:sp[0]]
+		l := ""
+		switch {
+		case inComment(before, trimmed, st):
+			l = "comment"
+		case inString(before, st):
+			l = "string"
+		}
+		if l == "" {
+			return classifyCode(h, sp, trimmed, st)
+		}
+		if k == 0 {
+			first = l
+		}
 	}
-	if inString(before, st) {
-		return "string"
-	}
+	return first
+}
+
+func classifyCode(h search.Hit, sp [2]int, trimmed string, st style) string {
+	before, after := h.Text[:sp[0]], h.Text[sp[1]:]
 	if importLine.MatchString(trimmed) {
 		return "import"
 	}
-	if defKeyword.MatchString(before) {
+	if st.code && defKeyword.MatchString(before) {
 		return "definition"
 	}
 	if declKeyword.MatchString(before) || goDecl.MatchString(after) {
@@ -440,6 +489,133 @@ func classify(h search.Hit, st style) string {
 		return "assignment"
 	}
 	return ""
+}
+
+// inString: the text ends inside a string literal. Interpolations
+// (`${x}` in a template, {x} in a Python f-string) are code, and a
+// character literal ('"') opens nothing.
+func inString(before string, st style) bool {
+	var open byte
+	interp := false // the open string interpolates: ` or f"
+	depth := 0      // inside ${…} or {…} of an interpolating string
+	for i := 0; i < len(before); i++ {
+		c := before[i]
+		if depth > 0 {
+			switch c {
+			case '{':
+				depth++
+			case '}':
+				depth--
+			}
+			continue
+		}
+		if c == '\\' {
+			i++
+			continue
+		}
+		if open != 0 {
+			switch {
+			case c == open:
+				open = 0
+			case interp && open == '`' && c == '$' && i+1 < len(before) && before[i+1] == '{':
+				depth, i = 1, i+1
+			case interp && open != '`' && c == '{':
+				if i+1 < len(before) && before[i+1] == '{' {
+					i++ // {{ is a literal brace
+				} else {
+					depth = 1
+				}
+			}
+			continue
+		}
+		if c == '\'' && strings.IndexByte(st.quotes, '\'') < 0 {
+			// a character literal: 'x', '\n', '"' (Rust lifetimes have no closing quote)
+			if i+2 < len(before) && before[i+2] == '\'' {
+				i += 2
+			} else if i+3 < len(before) && before[i+1] == '\\' && before[i+3] == '\'' {
+				i += 3
+			}
+			continue
+		}
+		if strings.IndexByte(st.quotes, c) >= 0 {
+			if c == '\'' && i > 0 && isWord(before[i-1]) && !fPrefix(before[:i]) {
+				continue // it's, don't
+			}
+			open = c
+			interp = c == '`' || st.fstrings && fPrefix(before[:i])
+		}
+	}
+	return open != 0 && depth == 0
+}
+
+// fPrefix: the string about to open is a Python f-string (f"…", rf'…').
+func fPrefix(s string) bool {
+	n := len(s)
+	for k := 1; k <= 2 && k <= n; k++ {
+		p := strings.ToLower(s[n-k:])
+		if (p == "f" || p == "rf" || p == "fr") && (n == k || !isWord(s[n-k-1])) {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	typedBefore = regexp.MustCompile(`^\s*(?:(?:public|private|protected|internal|static|final|readonly|const|volatile|transient|abstract|override|virtual|mutable|unsigned|signed|inline|constexpr|required|sealed|partial|new)\s+)*[\w:.<>\[\]?*&, ]*[\w>\]?*&]\s*[*&]?\s*$`)
+	typedAfter  = regexp.MustCompile(`^\s*(?:[;=,\[{)]|\(|$|:\s*\d)`)
+)
+
+// isField: the hit names a field, attribute, member or (in an interface) a
+// method of the type or class directly around it. In Java, C#, C and C++
+// the type comes first (private final Sampler sampler;), elsewhere the
+// name (Lines int, limit: number, count = 0).
+// It returns the field's name, or "".
+func isField(s outline.Symbol, h search.Hit, typed bool) string {
+	if !containers[s.Kind] || h.Line == s.Line {
+		return ""
+	}
+	for _, sp := range h.Spans { // in "Sampler sampler;" the second match is the name
+		a, b := widen(h.Text, sp[0], sp[1])
+		if typed && typedBefore.MatchString(h.Text[:a]) && typedAfter.MatchString(h.Text[b:]) ||
+			!typed && fieldBefore.MatchString(h.Text[:a]) && fieldAfter.MatchString(h.Text[b:]) {
+			return h.Text[a:b]
+		}
+	}
+	return ""
+}
+
+// widen grows a match to the whole identifier around it (for --partial and
+// regexes: "recent" in recent_projects).
+func widen(text string, a, b int) (int, int) {
+	for a > 0 && (isWord(text[a-1]) || text[a-1] == '$') {
+		a--
+	}
+	for b < len(text) && (isWord(text[b]) || text[b] == '$') {
+		b++
+	}
+	return a, b
+}
+
+// isDef: the hit is on the symbol's first line and matches its name. For
+// -d with a regex, any match on that line counts (impl.*Display for).
+func isDef(s outline.Symbol, h search.Hit, p *search.Pattern) bool {
+	if h.Line != s.Line {
+		return false
+	}
+	if p.DefMode && !p.Smart {
+		return true
+	}
+	name := lastPart(s.Name)
+	for _, sp := range h.Spans {
+		a, b := sp[0], sp[1]
+		if !p.Smart {
+			a, b = widen(h.Text, a, b)
+		}
+		if strings.EqualFold(lastPart(h.Text[a:b]), name) {
+			return true
+		}
+	}
+	return false
 }
 
 func inComment(before, trimmed string, st style) bool {
@@ -471,31 +647,6 @@ func inComment(before, trimmed string, st style) bool {
 		return true
 	}
 	return false
-}
-
-// inString: an odd number of unescaped quotes of one kind precede the match.
-func inString(before string, st style) bool {
-	var open byte
-	for i := 0; i < len(before); i++ {
-		c := before[i]
-		if c == '\\' {
-			i++
-			continue
-		}
-		if open != 0 {
-			if c == open {
-				open = 0
-			}
-			continue
-		}
-		if strings.IndexByte(st.quotes, c) >= 0 {
-			if c == '\'' && i > 0 && isWord(before[i-1]) {
-				continue // it's, don't
-			}
-			open = c
-		}
-	}
-	return open != 0
 }
 
 func isWord(c byte) bool {

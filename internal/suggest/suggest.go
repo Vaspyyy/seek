@@ -4,6 +4,7 @@
 package suggest
 
 import (
+	"bytes"
 	"regexp"
 	"runtime"
 	"sort"
@@ -77,11 +78,19 @@ func tokens(paths []string) map[string]*stat {
 					continue
 				}
 				seen := map[string]bool{}
-				for _, m := range tokenRe.FindAll(data, -1) {
-					if len(m) < 3 {
+				onLine := map[string]int{} // count lines, like the search does
+				line, at := 1, 0
+				for _, loc := range tokenRe.FindAllIndex(data, -1) {
+					if loc[1]-loc[0] < 3 {
 						continue
 					}
-					t := string(m)
+					line += bytes.Count(data[at:loc[0]], []byte{'\n'})
+					at = loc[0]
+					t := string(data[loc[0]:loc[1]])
+					if onLine[t] == line {
+						continue
+					}
+					onLine[t] = line
 					st := local[t]
 					if st == nil {
 						st = &stat{}
