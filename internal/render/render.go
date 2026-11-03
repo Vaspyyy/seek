@@ -389,8 +389,14 @@ func (w *writer) window(f *group.File, g *group.Group, whole bool) []shownLine {
 	}
 	lines := splitLines(f.Data)
 	want := map[int]bool{}
-	if whole && g.Sym >= 0 && g.End-g.Line+1 <= bodyMax {
-		for n := g.Line; n <= g.End; n++ {
+	first := g.Line // a hit in the doc comment above: start there
+	for _, h := range g.Hits {
+		if g.Sym >= 0 && h.Line < first {
+			first = h.Line
+		}
+	}
+	if whole && g.Sym >= 0 && g.End-first+1 <= bodyMax {
+		for n := first; n <= g.End; n++ {
 			want[n] = true
 		}
 	} else {
@@ -402,7 +408,7 @@ func (w *writer) window(f *group.File, g *group.Group, whole bool) []shownLine {
 		}
 		for _, h := range g.Hits {
 			for n := h.Line - ctx; n <= h.Line+ctx; n++ {
-				if n >= 1 && n <= len(lines) && (g.Sym < 0 || n >= g.Line && n <= g.End || !whole) {
+				if n >= 1 && n <= len(lines) && (g.Sym < 0 || n >= first && n <= g.End || !whole) {
 					want[n] = true
 				}
 			}

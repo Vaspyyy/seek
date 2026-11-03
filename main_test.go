@@ -358,3 +358,11 @@ func TestOneLineFiles(t *testing.T) {
 	expect(t, out, "long.txt  1 line, long lines, 1 hit: L1 …xxxxxxxxxxxxxxxxxxxxxxxxxxxxx needle",
 		"app.min.js  1 line, minified, 1 hit (1 declaration): L1 var needle=1;aaaa", "go.sum  3 lines, lock file, 3 hits: L1, 2, 3")
 }
+
+// -s starts a definition at its doc comment when the hit is there.
+func TestBodyIncludesDocCommentHit(t *testing.T) {
+	write := project(t)
+	write("a.rs", "/// The label is yellow.\nfn label() -> u32 {\n    1\n}\n")
+	out, _ := seek(t, "-s", "yellow")
+	expect(t, out, "  fn label  L2-4\n    1: /// The label is yellow.  (comment)\n    2- fn label() -> u32 {")
+}
