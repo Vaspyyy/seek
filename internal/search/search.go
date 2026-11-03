@@ -456,8 +456,14 @@ func Kind(path string, data []byte) string {
 	case strings.Contains("/"+p, "/vendor/") || strings.Contains("/"+p, "/node_modules/") ||
 		strings.Contains("/"+p, "/third_party/") || strings.Contains("/"+p, "/thirdparty/"):
 		return "vendored"
-	case strings.Contains(base, ".min.") || longLines(data):
+	case strings.Contains(base, ".min."):
 		return "minified"
+	case longLines(data):
+		switch filepath.Ext(base) {
+		case ".js", ".mjs", ".cjs", ".css", ".json", ".html", ".svg", ".map":
+			return "minified"
+		}
+		return "long lines"
 	case generated(data):
 		return "generated"
 	}

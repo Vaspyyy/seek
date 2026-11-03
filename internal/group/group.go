@@ -4,6 +4,7 @@
 package group
 
 import (
+	"bytes"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -77,8 +78,26 @@ func Build(f *search.File, p *search.Pattern) *File {
 	st := styleOf(f.Path)
 	byKey := map[int]*Group{}
 	var lines []string
+	inText := multiline(f.Path, f.Data)
+	if len(inText) > 0 {
+		// definitions the outline found inside a docstring or a template aren't real
+		var keep []outline.Symbol
+		for _, s := range out.Syms {
+			if !inText[s.Line] {
+				keep = append(keep, s)
+			}
+		}
+		if len(keep) < len(out.Syms) {
+			out.Syms = reparent(keep)
+		}
+	}
 	for _, h := range f.Hits {
 		si := innermost(out.Syms, h.Line)
+		if inText[h.Line] {
+			g := groupFor(out, byKey, si)
+			g.Hits = append(g.Hits, Hit{Hit: h, Label: "string"})
+			continue
+		}
 		if len(out.Syms) > 0 && commentLine(h.Text, st) {
 			if lines == nil {
 				lines = strings.Split(string(f.Data), "\n")
@@ -87,16 +106,7 @@ func Build(f *search.File, p *search.Pattern) *File {
 				si = d // a doc comment belongs to the definition below it
 			}
 		}
-		g := byKey[si]
-		if g == nil {
-			g = &Group{Sym: si}
-			if si >= 0 {
-				s := out.Syms[si]
-				g.Kind, g.Name, g.Sig, g.Line, g.End = s.Kind, outline.Qualified(out.Syms, si), s.Sig, s.Line, s.End
-			}
-			byKey[si] = g
-			out.Groups = append(out.Groups, g)
-		}
+		g := groupFor(out, byKey, si)
 		hit := Hit{Hit: h}
 		if si >= 0 && isField(out.Syms[si], h) {
 			hit.Label = "definition"
@@ -202,6 +212,116 @@ func isField(s outline.Symbol, h search.Hit) bool {
 	}
 	a, b := h.Spans[0][0], h.Spans[0][1]
 	return fieldBefore.MatchString(h.Text[:a]) && fieldAfter.MatchString(h.Text[b:])
+}
+
+func groupFor(out *File, byKey map[int]*Group, si int) *Group {
+	g := byKey[si]
+	if g == nil {
+		g = &Group{Sym: si}
+		if si >= 0 {
+			s := out.Syms[si]
+			g.Kind, g.Name, g.Sig, g.Line, g.End = s.Kind, outline.Qualified(out.Syms, si), s.Sig, s.Line, s.End
+		}
+		byKey[si] = g
+		out.Groups = append(out.Groups, g)
+	}
+	return g
+}
+
+// reparent recomputes parents after symbols were dropped.
+func reparent(syms []outline.Symbol) []outline.Symbol {
+	for i := range syms {
+		syms[i].Parent = -1
+		for j := i - 1; j >= 0; j-- {
+			if syms[j].Line < syms[i].Line && syms[j].End >= syms[i].End && syms[j].End > syms[j].Line {
+				syms[i].Parent = j
+				break
+			}
+		}
+	}
+	return syms
+}
+
+// multiline marks the lines inside strings that span lines: Python's
+// triple-quoted strings (docstrings), backtick strings in JavaScript,
+// TypeScript and Go. The opening line isn't marked (code may come
+// before the quotes); the lines after it up to the closing one are.
+func multiline(path string, data []byte) map[int]bool {
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
+	py := ext == "py" || ext == "pyi"
+	var marks []string
+	switch {
+	case py:
+		marks = []string{`"""`, `'''`}
+	case ext == "js" || ext == "mjs" || ext == "cjs" || ext == "ts" || ext == "tsx" || ext == "jsx" || ext == "mts" || ext == "cts" || ext == "go":
+		marks = []string{"`"}
+	default:
+		return nil
+	}
+	var in map[int]bool
+	open := ""
+	n := 0
+	for len(data) > 0 {
+		n++
+		line := data
+		if end := bytes.IndexByte(data, '\n'); end >= 0 {
+			line, data = data[:end], data[end+1:]
+		} else {
+			data = nil
+		}
+		if open != "" {
+			if in == nil {
+				in = map[int]bool{}
+			}
+			in[n] = true
+		}
+		s := string(line)
+		for i := 0; i < len(s); {
+			if open != "" {
+				switch {
+				case s[i] == '\\' && open == "`":
+					i += 2
+				case strings.HasPrefix(s[i:], open):
+					i += len(open)
+					open = ""
+				default:
+					i++
+				}
+				continue
+			}
+			if py && s[i] == '#' || !py && strings.HasPrefix(s[i:], "//") {
+				break // a comment
+			}
+			if s[i] == '\\' {
+				i += 2
+				continue
+			}
+			found := false
+			for _, m := range marks {
+				if strings.HasPrefix(s[i:], m) {
+					open, i, found = m, i+len(m), true
+					break
+				}
+			}
+			if found {
+				continue
+			}
+			if s[i] == '"' || s[i] == '\'' {
+				// a one-line string: its quotes don't open anything
+				q, j := s[i], i+1
+				for j < len(s) && s[j] != q {
+					if s[j] == '\\' {
+						j++
+					}
+					j++
+				}
+				i = j + 1
+				continue
+			}
+			i++
+		}
+	}
+	return in
 }
 
 // innermost is the deepest symbol whose lines contain n, or -1.

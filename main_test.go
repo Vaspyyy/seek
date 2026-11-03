@@ -333,3 +333,28 @@ func TestBadArguments(t *testing.T) {
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }
+
+// Text in docstrings and multi-line template strings is a string, and
+// definitions in it aren't definitions.
+func TestMultilineStrings(t *testing.T) {
+	write := project(t)
+	write("m.py", "\"\"\"Module.\n\ndef fake():  # an example\n\"\"\"\n\n\ndef real():\n    s = '''\n    fake text\n    '''\n    return s\n")
+	write("t.ts", "const page = `\n  function fake() {}\n`;\nexport function realTs() { return page; }\n")
+	out, _ := seek(t, "-d", "fake|real|realTs")
+	expect(t, out, "m.py:7-11  def real():", "t.ts:4  export function realTs()")
+	reject(t, out, "m.py:3", "t.ts:2")
+	out, _ = seek(t, "fake")
+	expect(t, out, "3 def fake():  # an example  (string)", "9 fake text  (string)", "2 function fake() {}  (string)")
+}
+
+// Lock, minified and long-line files stay on one line, with a snippet
+// around a hit when there are only one or two.
+func TestOneLineFiles(t *testing.T) {
+	write := project(t)
+	write("long.txt", strings.Repeat("x", 6000)+" needle\n")
+	write("app.min.js", "var needle=1;"+strings.Repeat("a", 6000)+"\n")
+	write("go.sum", "a needle 1\nb needle 2\nc needle 3\n")
+	out, _ := seek(t, "needle")
+	expect(t, out, "long.txt  1 line, long lines, 1 hit: L1 …xxxxxxxxxxxxxxxxxxxxxxxxxxxxx needle",
+		"app.min.js  1 line, minified, 1 hit (1 declaration): L1 var needle=1;aaaa", "go.sum  3 lines, lock file, 3 hits: L1, 2, 3")
+}

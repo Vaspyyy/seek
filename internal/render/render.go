@@ -201,10 +201,16 @@ func (w *writer) file(f *group.File, lv int) {
 	switch {
 	case lv == 1 && f.Kind != "":
 		var ls []string
+		var snips []string
 		for _, g := range f.Groups {
 			for _, h := range g.Hits {
 				ls = append(ls, strconv.Itoa(h.Line))
+				snips = append(snips, "L"+strconv.Itoa(h.Line)+" "+w.snippet(h))
 			}
+		}
+		if len(snips) <= 2 {
+			w.line("%s: %s", head, strings.Join(snips, "  "))
+			return
 		}
 		w.line("%s: L%s", head, joinCapped(ls, 8))
 		return
@@ -461,6 +467,33 @@ func (w *writer) highlight(h group.Hit, raw bool) string {
 		return pre + w.mark(text, spans) + post
 	}
 	return w.mark(text, spans)
+}
+
+// snippet is a short piece of a hit line around its first match.
+func (w *writer) snippet(h group.Hit) string {
+	text, spans := strings.TrimSpace(h.Text), h.Spans
+	if cut := len(h.Text) - len(strings.TrimLeft(h.Text, " \t")); cut > 0 {
+		spans = shift(spans, -cut, len(text))
+	}
+	if len(text) <= 80 || len(spans) == 0 {
+		return w.mark(clipLine(text, 80), shift(spans, 0, min(len(text), 80)))
+	}
+	from := max(0, spans[0][0]-30)
+	for from > 0 && !utf8Start(text[from]) {
+		from--
+	}
+	to := min(len(text), from+80)
+	for to < len(text) && !utf8Start(text[to]) {
+		to++
+	}
+	pre, post := "", ""
+	if from > 0 {
+		pre = "…"
+	}
+	if to < len(text) {
+		post = "…"
+	}
+	return pre + w.mark(text[from:to], shift(spans, -from, to-from)) + post
 }
 
 func utf8Start(b byte) bool { return b&0xC0 != 0x80 }
