@@ -18,6 +18,7 @@ import (
 type Pattern struct {
 	Re    *regexp.Regexp
 	Words []string // the identifiers searched for, if the pattern is a list of them
+	Names []string // identifiers in the pattern, also in a regex (for suggestions)
 	Smart bool     // whole words only, because the pattern is a list of identifiers
 	Text  bool     // searched as plain text (-F, or not a valid regex)
 	Fold  bool     // case-insensitive
@@ -90,6 +91,10 @@ func Compile(expr string, o Options) (*Pattern, error) {
 		return nil, err
 	}
 	p.Re = re
+	p.Names = p.Words
+	if p.Names == nil {
+		p.Names = namesIn(expr, o.Fixed || p.Bad != "")
+	}
 	if !o.IgnoreCase {
 		if sre, err := syntax.Parse(src, syntax.Perl); err == nil {
 			p.need = required(sre.Simplify())
@@ -157,6 +162,32 @@ func (p *Pattern) mayMatch(data []byte) bool {
 		}
 	}
 	return false
+}
+
+var (
+	escapeRe = regexp.MustCompile(`\\.`)
+	nameRe   = regexp.MustCompile(`[A-Za-z_$][\w$]{3,}`)
+	keywords = map[string]bool{"function": true, "const": true, "return": true, "export": true, "async": true, "await": true,
+		"class": true, "self": true, "this": true, "static": true, "import": true, "from": true, "default": true, "public": true,
+		"private": true, "struct": true, "impl": true, "type": true, "interface": true, "func": true, "true": true, "false": true,
+		"null": true, "None": true, "undefined": true, "else": true, "while": true, "for": true, "new": true}
+)
+
+// namesIn finds the identifiers in a regex ("function\s+loadMap|\.mapData"
+// has loadMap and mapData), leaving out escapes and common keywords.
+func namesIn(expr string, text bool) []string {
+	if !text {
+		expr = escapeRe.ReplaceAllString(expr, " ")
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, n := range nameRe.FindAllString(expr, -1) {
+		if !keywords[n] && !seen[n] && len(out) < 6 {
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 func shortErr(err error) string {

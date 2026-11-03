@@ -389,10 +389,10 @@ func hints(out *bufio.Writer, o options, p *search.Pattern, paths []string) {
 			fmt.Fprintf(out, "  inside longer words: %s in %s (%s): seek --partial %s\n", plural(n, "hit"), plural(nf, "file"), strings.Join(ws, ", "), shellQuote(o.pattern))
 		}
 	}
-	if len(p.Words) == 0 {
+	if len(p.Names) == 0 {
 		return
 	}
-	names := suggest.Similar(p.Words, paths, 8)
+	names := suggest.Similar(p.Names, paths, 8)
 	if len(names) == 0 {
 		return
 	}

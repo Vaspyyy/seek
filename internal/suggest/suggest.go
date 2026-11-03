@@ -140,8 +140,28 @@ func score(q, tok string) int {
 		return 5
 	case len(tok) >= 5 && strings.Contains(lq, lt) && 2*len(tok) >= len(q):
 		return 6
+	case renamed(parts(q), parts(tok)):
+		return 7
 	}
 	return 0
+}
+
+// renamed: the names differ in one part, not the last (rebuildFrontlineField
+// and invalidateFrontlineField).
+func renamed(q, t []string) bool {
+	if len(q) < 3 || len(t) < 3 || q[len(q)-1] != t[len(t)-1] {
+		return false
+	}
+	shared := 0
+	for _, p := range q {
+		for _, x := range t {
+			if p == x {
+				shared++
+				break
+			}
+		}
+	}
+	return shared >= len(q)-1 && shared >= len(t)-1
 }
 
 func squash(s string) string {

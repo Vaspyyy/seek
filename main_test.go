@@ -232,6 +232,10 @@ func TestNoHitsHints(t *testing.T) {
 	expect(t, out, "ignoring case: 1 hit in 1 file (rebuildFrontline): seek -i rebuildfrontline")
 	out, _ = seek(t, "rebuildFrontLine")
 	expect(t, out, "rebuildFrontline  1 hit")
+	// names inside a regex get suggestions too; a name with another verb is similar
+	write("world.js", "export function invalidateFrontlineField() {}\n")
+	out, _ = seek(t, `function\s+rebuildFrontlineField\(`)
+	expect(t, out, "invalidateFrontlineField  1 hit, defined at world.js:1 (function)")
 }
 
 func TestPatterns(t *testing.T) {
