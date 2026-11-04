@@ -86,6 +86,7 @@ func (w *writer) line(format string, args ...any) {
 // Layout is how much of each file fits the budget.
 type Layout struct {
 	level []int // per shown file: 1 one line, 2 a line per definition, 3 hit lines, 4 whole definitions
+	ctx   []int // per shown file with -C: the context lines that fit (at most -C)
 }
 
 // Reduced counts the shown files that didn't get what -s or -C asked for
@@ -105,7 +106,7 @@ func (l *Layout) Reduced(files []*group.File, o Options) (reduced, total int) {
 			continue
 		}
 		total++
-		if lv < want {
+		if lv < want || l.ctx != nil && l.ctx[i] < o.Context {
 			reduced++
 		}
 	}
@@ -136,7 +137,33 @@ func Plan(files []*group.File, o Options) *Layout {
 		level[i] = 1
 	}
 	room -= shown
-	cost := func(i, lv int) int { return w.cost(files[i], lv) }
+	ctx := make([]int, shown)
+	for i := range ctx {
+		ctx[i] = o.Context
+	}
+	cost := func(i, lv int) int {
+		cw := *w
+		cw.o.Context = ctx[i]
+		return cw.cost(files[i], lv)
+	}
+	// fits raises file i to level lv if that fits the room left; with -C,
+	// with as much context as fits (down to none) rather than not at all
+	fits := func(i, lv int) bool {
+		was := ctx[i]
+		for c := o.Context; ; c /= 2 {
+			old := cost(i, level[i])
+			ctx[i] = c
+			if d := cost(i, lv) - old; d <= room {
+				room -= d
+				level[i] = lv
+				return true
+			}
+			ctx[i] = was
+			if c == 0 || lv < 3 {
+				return false
+			}
+		}
+	}
 	top := 3
 	if o.Counts {
 		top = 2
@@ -151,42 +178,36 @@ func Plan(files []*group.File, o Options) *Layout {
 			if lv == 3 && top == 5 {
 				// -s: whole definitions for the first files that fit, in order,
 				// else the lines around their hits, rather than hit lines for all
-				for _, want := range []int{5, 4} {
-					if d := cost(i, want) - cost(i, level[i]); d <= room {
-						room -= d
-						level[i] = want
-						break
-					}
-				}
-				if level[i] >= 4 {
+				if fits(i, 5) || fits(i, 4) {
 					continue
 				}
 			}
-			if d := cost(i, lv) - cost(i, level[i]); d <= room {
-				room -= d
-				level[i] = lv
-			}
+			fits(i, lv)
 		}
 	}
 	if top == 5 { // what's left: more code for files that got less
 		for _, want := range []int{4, 5} {
 			for i := range level {
 				if level[i] >= 3 && level[i] < want {
-					if d := cost(i, want) - cost(i, level[i]); d <= room {
-						room -= d
-						level[i] = want
-					}
+					fits(i, want)
 				}
 			}
 		}
 	}
-	return &Layout{level: level}
+	l := &Layout{level: level}
+	if o.Context > 0 {
+		l.ctx = ctx
+	}
+	return l
 }
 
 // Print prints the files as planned.
 func Print(out io.Writer, files []*group.File, l *Layout, o Options) {
 	w := &writer{w: out, c: colors(o.Color), o: o}
 	for i, lv := range l.level {
+		if l.ctx != nil {
+			w.o.Context = l.ctx[i]
+		}
 		w.file(files[i], max(lv, 1))
 	}
 	shown := len(l.level)

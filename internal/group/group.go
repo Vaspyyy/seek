@@ -113,8 +113,8 @@ func Build(f *search.File, p *search.Pattern) *File {
 					si = d // in the doc comment of the definition below
 				}
 			}
-			if l == "string" && within(h.Spans, inCode[h.Line]) {
-				l = "" // code in a template's ${…}
+			if l == "string" && anyWithin(h.Spans, inCode[h.Line]) {
+				l = "" // code in a template's ${…}: one hit in code decides
 			}
 			g := groupFor(out, byKey, si)
 			g.Hits = append(g.Hits, Hit{Hit: h, Label: l})
@@ -245,8 +245,10 @@ func topLevelDecl(h search.Hit, label string, st style) bool {
 	}
 	switch label {
 	case "declaration":
-		// const { a } = b binds a name from something defined elsewhere
-		return h.Text == strings.TrimLeft(h.Text, " \t") && !strings.ContainsAny(h.Text[:h.Spans[0][0]], "{[")
+		// const { a } = b binds a name from something defined elsewhere, and
+		// for (let i = …) a loop counter
+		before := h.Text[:h.Spans[0][0]]
+		return h.Text == strings.TrimLeft(h.Text, " \t") && !strings.ContainsAny(before, "{[(")
 	case "assignment":
 		return st.fstrings && h.Spans[0][0] == 0 // Python: NAME = … at module level
 	}
@@ -422,24 +424,16 @@ func interpEnd(s string, i int) int {
 	return -1
 }
 
-// within: every span lies inside one of the ranges.
-func within(spans, ranges [][2]int) bool {
-	if len(spans) == 0 || len(ranges) == 0 {
-		return false
-	}
+// anyWithin: a span lies inside one of the ranges.
+func anyWithin(spans, ranges [][2]int) bool {
 	for _, sp := range spans {
-		in := false
 		for _, r := range ranges {
 			if sp[0] >= r[0] && sp[1] <= r[1] {
-				in = true
-				break
+				return true
 			}
 		}
-		if !in {
-			return false
-		}
 	}
-	return true
+	return false
 }
 
 // docStart is the first line of the comment and decorator block directly

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -107,7 +108,9 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	}
 	found, st := search.Run(paths, p)
 	gs := buildAll(found, p)
+	allHits := 0 // before --writes
 	if o.writes {
+		allHits = countHits(gs)
 		gs = writesOnly(gs)
 	}
 	if o.list && o.defs {
@@ -118,6 +121,9 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 		// notes go to stderr, so the paths can be piped
 		if len(gs) == 0 {
 			fmt.Fprintf(errw, "seek: %s: no hits (without -l, seek suggests what would match)\n", describe(p))
+			ew := bufio.NewWriter(errw)
+			skipped(ew, o, st, true)
+			ew.Flush()
 		} else if m := missed(o, p, paths, countHits(gs)); m.lines > 0 && !o.defs {
 			fmt.Fprintln(errw, "seek: "+m.note(o.pattern))
 		}
@@ -126,7 +132,11 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 			end = "\x00"
 		}
 		for _, f := range gs {
-			fmt.Fprint(out, f.Path+end)
+			path := f.Path
+			if strings.HasPrefix(path, "-") {
+				path = "./" + path // not an option to the command it's piped to
+			}
+			fmt.Fprint(out, path+end)
 		}
 		return exitCode(len(gs) > 0)
 	}
@@ -150,22 +160,37 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	for _, f := range gs {
 		hits += f.Count()
 	}
+	if hits == 0 && allHits > 0 {
+		fmt.Fprintf(out, "seek: %s in %s: no hits that set it (%s: %s)\n", describe(p), scope, plural(allHits, "other hit"), command("", o.pattern))
+		return 1
+	}
 	if hits == 0 {
 		fmt.Fprintf(out, "seek: %s in %s: no hits\n", describe(p), scope)
+		if d := qualifiedDef(o, p, paths); d != "" {
+			fmt.Fprintf(out, "  defined at %s: %s\n", d, command("-d ", o.pattern))
+		}
 		skipped(out, o, st, true)
 		hints(out, o, p, paths)
 		return 1
 	}
-	head := fmt.Sprintf("seek: %s: %s in %s", describe(p), plural(hits, "hit"), plural(len(gs), "file"))
+	count := plural(hits, "hit")
+	if o.writes {
+		count += " that set it"
+	}
+	head := fmt.Sprintf("seek: %s: %s in %s", describe(p), count, plural(len(gs), "file"))
 	if len(o.paths) > 0 || len(o.globs) > 0 || st.TooBig > 0 {
-		head = fmt.Sprintf("seek: %s in %s: %s in %s", describe(p), scope, plural(hits, "hit"), plural(len(gs), "file"))
+		head = fmt.Sprintf("seek: %s in %s: %s in %s", describe(p), scope, count, plural(len(gs), "file"))
 	}
 	layout := render.Plan(gs, ro)
 	if d := defsLine(gs, 3, p, layout); d != "" {
 		head += "; defined at " + d
 	}
 	fmt.Fprintln(out, head)
-	if m := missed(o, p, paths, hits); m.lines > 0 {
+	if o.writes {
+		if n := allHits - hits; n > 0 {
+			fmt.Fprintf(out, "+%s that don't set it: %s\n", plural(n, "more hit"), command("", o.pattern))
+		}
+	} else if m := missed(o, p, paths, hits); m.lines > 0 {
 		fmt.Fprintln(out, m.note(o.pattern)) // first, where it can't be overlooked
 	}
 	render.Print(out, gs, layout, ro)
@@ -178,19 +203,27 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 // (binary, too big), and, when nothing was found, the binary files, ignored
 // folders and nested repositories that weren't searched.
 func skipped(out *bufio.Writer, o options, st search.Stats, none bool) {
-	binary := st.Binary
+	named := map[string]bool{}
 	for _, path := range o.paths {
 		if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
 			if _, why := search.Read(path); why != "" {
 				fmt.Fprintf(out, "  not searched: %s is %s\n", path, why)
-				if why == "binary" {
-					binary--
-				}
+				named[path] = true
 			}
 		}
 	}
-	if none && binary > 0 {
-		fmt.Fprintf(out, "  not searched: %s\n", plural(binary, "binary file"))
+	var binary []string
+	for _, path := range st.BinaryPaths {
+		if !named[path] {
+			binary = append(binary, path)
+		}
+	}
+	if none && len(binary) > 0 {
+		list := strings.Join(binary[:min(len(binary), 3)], ", ")
+		if len(binary) > 3 {
+			list += fmt.Sprintf(", +%d more", len(binary)-3)
+		}
+		fmt.Fprintf(out, "  not searched: %s (%s)\n", plural(len(binary), "binary file"), list)
 	}
 	if none && !o.unrestrict {
 		if sk := files.Skipped(6); len(sk) > 0 {
@@ -216,7 +249,7 @@ func notes(out *bufio.Writer, l *render.Layout, gs []*group.File, ro render.Opti
 	if reduced, total := l.Reduced(gs, ro); reduced > 0 {
 		flag, what := "-s", "show only part of their definitions"
 		if !ro.Bodies {
-			flag, what = "-C", "show their hits without context"
+			flag, what = "-C", "show less context around their hits"
 		}
 		if reduced == 1 {
 			what = strings.Replace(strings.Replace(what, "show ", "shows ", 1), "their", "its", 1)
@@ -248,9 +281,11 @@ func missed(o options, p *search.Pattern, paths []string, wholeLines int) missed
 	found, _ := search.Run(paths, q)
 	lines := 0
 	counts := map[string]int{}
-	exact := map[string]bool{}
-	for _, w := range p.Words {
-		exact[lastPart(w)] = true
+	// a word the search itself matches whole (limit for lim.t, LIMIT with
+	// -i) is a hit already, not a missed one
+	exact := func(w string) bool {
+		loc := p.Re.FindStringIndex(w)
+		return loc != nil && loc[0] == 0 && loc[1] == len(w)
 	}
 	longer, cased := false, false
 	for _, f := range found {
@@ -259,7 +294,7 @@ func missed(o options, p *search.Pattern, paths []string, wholeLines int) missed
 			seen := map[string]bool{}
 			for _, s := range h.Spans {
 				w := wordAt(h.Text, s[0], s[1])
-				if exact[w] || seen[w] {
+				if exact(w) || seen[w] {
 					continue
 				}
 				seen[w] = true
@@ -267,7 +302,7 @@ func missed(o options, p *search.Pattern, paths []string, wholeLines int) missed
 				if len(w) > s[1]-s[0] {
 					longer = true
 				}
-				if !p.Fold && !exact[h.Text[s[0]:s[1]]] {
+				if !exact(h.Text[s[0]:s[1]]) {
 					cased = true
 				}
 			}
@@ -299,6 +334,8 @@ func missed(o options, p *search.Pattern, paths []string, wholeLines int) missed
 		m.what, m.flags = "in another case or inside longer words", "-i --partial "
 	case cased:
 		m.what, m.flags = "in another case", "-i "
+	case p.Fold:
+		m.what, m.flags = "inside longer words", "-i --partial "
 	default:
 		m.what, m.flags = "inside longer words", "--partial "
 	}
@@ -355,7 +392,7 @@ func writesOnly(gs []*group.File) []*group.File {
 		for _, g := range f.Groups {
 			var hs []group.Hit
 			for _, h := range g.Hits {
-				if h.Label == "definition" || h.Label == "declaration" || h.Label == "assignment" {
+				if (h.Label == "definition" || h.Label == "declaration" || h.Label == "assignment") && !readsOnly(h) {
 					hs = append(hs, h)
 				}
 			}
@@ -370,6 +407,24 @@ func writesOnly(gs []*group.File) []*group.File {
 		}
 	}
 	return out
+}
+
+// getter matches a JavaScript getter's first line, up to its name.
+var getter = regexp.MustCompile(`^\s*(?:static\s+)?get\s+$`)
+
+// readsOnly: a definition or declaration hit that reads the name rather
+// than setting it: a getter (get x()) or a destructuring key
+// (const { x: alias } = data, which declares alias).
+func readsOnly(h group.Hit) bool {
+	if len(h.Spans) == 0 {
+		return false
+	}
+	before, after := h.Text[:h.Spans[0][0]], strings.TrimSpace(h.Text[h.Spans[0][1]:])
+	if h.Label == "definition" && getter.MatchString(before) {
+		return true
+	}
+	return h.Label == "declaration" && strings.Contains(before, "{") &&
+		strings.HasPrefix(after, ":") && !strings.HasPrefix(after, "::")
 }
 
 func countHits(gs []*group.File) int {
@@ -810,6 +865,9 @@ func wordAt(text string, a, b int) string {
 	isW := func(r rune) bool { return r == '_' || r == '$' || unicode.IsLetter(r) || unicode.IsDigit(r) }
 	for a > 0 {
 		r, n := utf8.DecodeLastRuneInString(text[:a])
+		if r == utf8.RuneError && n == 1 {
+			r = rune(text[a-1]) // not UTF-8: a Latin-1 byte
+		}
 		if !isW(r) {
 			break
 		}
@@ -817,6 +875,9 @@ func wordAt(text string, a, b int) string {
 	}
 	for b < len(text) {
 		r, n := utf8.DecodeRuneInString(text[b:])
+		if r == utf8.RuneError && n == 1 {
+			r = rune(text[b])
+		}
 		if !isW(r) {
 			break
 		}
@@ -837,6 +898,31 @@ func firstDef(word string, paths []string) string {
 		g := group.Build(f, p)
 		for _, d := range g.Defs {
 			if lastPart(d.Name) == word {
+				return fmt.Sprintf("%s:%d (%s)", f.Path, d.Line, d.Kind)
+			}
+		}
+	}
+	return ""
+}
+
+// qualifiedDef is where a qualified name (Repo.Changes) is defined when its
+// text never appears as such: func (r *Repo) Changes defines it.
+func qualifiedDef(o options, p *search.Pattern, paths []string) string {
+	if !p.Smart || len(p.Words) != 1 || !strings.Contains(p.Words[0], ".") {
+		return ""
+	}
+	name := p.Words[0]
+	so := o.so
+	so.Partial = false
+	q, err := search.Compile(lastPart(name), so)
+	if err != nil {
+		return ""
+	}
+	q.DefMode = true
+	found, _ := search.Run(paths, q)
+	for _, f := range found {
+		for _, d := range group.Build(f, q).Defs {
+			if d.Name == name || strings.HasSuffix(d.Name, "."+name) {
 				return fmt.Sprintf("%s:%d (%s)", f.Path, d.Line, d.Kind)
 			}
 		}

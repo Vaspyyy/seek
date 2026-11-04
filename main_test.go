@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -632,4 +633,85 @@ func TestSecondRoundFollowups(t *testing.T) {
 			t.Errorf("%v: exit %d\n%s", args, code, out)
 		}
 	}
+}
+
+// From the final review round: with -i the note names only words -i doesn't
+// already match and keeps -i in its command; -l still says what it skipped;
+// --writes leaves out getters and destructuring keys; a Latin-1 letter
+// ends no word.
+func TestFinalRoundRegressions(t *testing.T) {
+	write := project(t)
+	write("a.js", "const LIMIT = 1;\nlet limit = 2;\nfunction f(o) {\n\tconst { limit: l } = o;\n\treturn limitOf(l);\n}\nclass C {\n\tget limit() { return 1; }\n}\n")
+	write("img/x.png", "\x89PNG\x00\x00")
+	write("latin1.txt", "limit caf\xe9 na\xefve\n")
+	out, _ := seek(t, "-i", "limit")
+	expect(t, out, "+1 more hit inside longer words (limitOf 1): seek -i --partial limit")
+	reject(t, out, "LIMIT 1")
+	var b, e bytes.Buffer
+	w := bufio.NewWriter(&b)
+	if code := run([]string{"-l", "zzqq"}, w, &e, false); code != 1 {
+		t.Errorf("-l with no hits: exit %d", code)
+	}
+	w.Flush()
+	if b.String() != "" || !strings.Contains(e.String(), "not searched: 1 binary file") {
+		t.Errorf("-l: stdout %q, stderr %q", b.String(), e.String())
+	}
+	out, _ = seek(t, "--writes", "limit", "a.js")
+	expect(t, out, "let limit = 2;")
+	reject(t, out, "const { limit: l }", "get limit()", "return limitOf")
+	out, code := seek(t, "caf", "latin1.txt")
+	if code != 1 || !strings.Contains(out, "no hits") {
+		t.Errorf("caf is not a whole word in caf\\xe9: exit %d\n%s", code, out)
+	}
+}
+
+// More from the final round (Opus): the note leaves out words the pattern
+// matches itself; --writes says what it left out; ^$ isn't "every line";
+// an empty file has no line 1; -C shrinks its context to fit rather than
+// dropping the hit lines; a qualified name with no text hits points to its
+// definition; skipped binary files are named; -l paths never look like
+// options; a loop counter defines nothing.
+func TestFinalRoundOpus(t *testing.T) {
+	write := project(t)
+	write("k.go", "package k\n\ntype Repo struct{}\n\n// Changes lists them.\nfunc (r *Repo) Changes() int { return 0 }\n\nvar limit = 1\nvar limitOf = 2\n")
+	write("w.js", "let target = 1;\nfor (const t of list) {}\nuse(target);\nfor (let tick = 0; tick < 3; tick++) {}\nconst s = `\n  more ${target + 1} text target\n`;\n")
+	write("empty.go", "")
+	write("-rf.js", "target();\n")
+	write("bin/a.png", "\x89PNG\x00\x00")
+	var big strings.Builder
+	big.WriteString("package big\n\nfunc Big() {\n")
+	for i := 0; i < 300; i++ {
+		fmt.Fprintf(&big, "\tx%d()\n", i)
+		if i%60 == 30 {
+			big.WriteString("\tneedle()\n")
+		}
+	}
+	big.WriteString("}\n")
+	write("big.go", big.String())
+
+	out, _ := seek(t, "lim.t", "k.go")
+	expect(t, out, "+1 more hit inside longer words (limitOf 1)")
+	out, _ = seek(t, "--writes", "target", "w.js")
+	expect(t, out, "1 hit that set it in 1 file", "+2 more hits that don't set it: seek target")
+	out, _ = seek(t, "--writes", "list", "w.js")
+	expect(t, out, "no hits that set it (1 other hit: seek list)")
+	reject(t, out, "ignoring case", "inside longer words")
+	out, _ = seek(t, "^$", "k.go")
+	reject(t, out, "every line")
+	out, code := seek(t, "^", "empty.go")
+	if code != 1 {
+		t.Errorf("an empty file has no lines: exit %d\n%s", code, out)
+	}
+	out, _ = seek(t, "-C", "40", "needle", "big.go")
+	expect(t, out, ": \tneedle()", "shows less context around its hits")
+	out, _ = seek(t, "Repo.Changes")
+	expect(t, out, "no hits", "defined at k.go:6 (func): seek -d Repo.Changes")
+	out, _ = seek(t, "zzqq")
+	expect(t, out, "not searched: 1 binary file (bin/a.png)")
+	out, _ = seek(t, "-l", "target")
+	expect(t, out, "./-rf.js\n")
+	out, _ = seek(t, "-d", "tick", "w.js")
+	expect(t, out, "no definition found")
+	out, _ = seek(t, "target", "w.js")
+	expect(t, out, "more ${target + 1} text target\n")
 }

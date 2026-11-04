@@ -32,7 +32,8 @@ type Pattern struct {
 	DefMode bool
 	need    [][]byte // a match contains one of these (nil: no such literal)
 	fold    bool     // need is lowercase: look for it in a lowercased copy
-	// Empty: the pattern matches the empty string, so every line
+	// Empty: the pattern matches the empty string anywhere (a|, ^, x*),
+	// so every line
 	Empty bool
 	words map[string]bool // many whole words: found by splitting lines into words
 }
@@ -112,7 +113,7 @@ func Compile(expr string, o Options) (*Pattern, error) {
 	}
 	p.Re = re
 	p.file = regexp.MustCompile("(?m)" + src)
-	p.Empty = re.MatchString("")
+	p.Empty = re.MatchString("") && re.MatchString("a z}") // ^$ matches only empty lines
 	p.Names = p.Words
 	if p.Names == nil {
 		p.Names = namesIn(expr, o.Fixed || p.Bad != "")
@@ -316,12 +317,20 @@ func wordLines(data []byte, words map[string]bool, fold bool) []Hit {
 // letters (ber_limit inside über_limit), which \b can't see.
 func wholeWord(text string, a, b int) bool {
 	if a > 0 {
-		if r, _ := utf8.DecodeLastRuneInString(text[:a]); wordRune(r) {
+		r, n := utf8.DecodeLastRuneInString(text[:a])
+		if r == utf8.RuneError && n == 1 {
+			r = rune(text[a-1]) // not UTF-8: read the byte as Latin-1 (é in café)
+		}
+		if wordRune(r) {
 			return false
 		}
 	}
 	if b < len(text) {
-		if r, _ := utf8.DecodeRuneInString(text[b:]); wordRune(r) {
+		r, n := utf8.DecodeRuneInString(text[b:])
+		if r == utf8.RuneError && n == 1 {
+			r = rune(text[b])
+		}
+		if wordRune(r) {
 			return false
 		}
 	}
@@ -379,6 +388,7 @@ const MaxSize = 32 << 20
 // Stats count what a search looked at.
 type Stats struct {
 	Files, Binary, TooBig int
+	BinaryPaths           []string // the first few binary files, in path order
 }
 
 // Run searches paths in parallel and returns the files with hits, in the
@@ -399,6 +409,7 @@ func Run(paths []string, p *Pattern) ([]*File, Stats) {
 				switch skip {
 				case "binary":
 					local.Binary++
+					local.BinaryPaths = append(local.BinaryPaths, paths[i])
 				case "too big":
 					local.TooBig++
 				default:
@@ -409,6 +420,7 @@ func Run(paths []string, p *Pattern) ([]*File, Stats) {
 			mu.Lock()
 			st.Files += local.Files
 			st.Binary += local.Binary
+			st.BinaryPaths = append(st.BinaryPaths, local.BinaryPaths...)
 			st.TooBig += local.TooBig
 			mu.Unlock()
 		}()
@@ -418,6 +430,7 @@ func Run(paths []string, p *Pattern) ([]*File, Stats) {
 	}
 	close(jobs)
 	wg.Wait()
+	sort.Strings(st.BinaryPaths)
 	var out []*File
 	for _, f := range results {
 		if f != nil {
@@ -503,6 +516,9 @@ func Lines(data []byte, re *regexp.Regexp) []Hit { return lines(data, re, re) }
 // lines finds the candidate lines with fileRe on the whole file (compiled
 // with (?m), so ^ and $ match at every line) and matches re on each.
 func lines(data []byte, fileRe, re *regexp.Regexp) []Hit {
+	if len(data) == 0 {
+		return nil // an empty file has no lines, not one empty line
+	}
 	locs := fileRe.FindAllIndex(data, -1)
 	if n := len(locs); n > 0 && len(data) > 0 && data[len(data)-1] == '\n' && locs[n-1][0] == len(data) {
 		locs = locs[:n-1] // after the last line break there is no line
