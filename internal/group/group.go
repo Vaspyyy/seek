@@ -52,6 +52,7 @@ type File struct {
 type Def struct {
 	Kind, Name, Sig string
 	Line, End       int
+	First           int  // where its doc comment starts (Line if there is none)
 	Outline         bool // found by the outline rules (not only by a keyword on its line)
 }
 
@@ -87,7 +88,8 @@ func Build(f *search.File, p *search.Pattern) *File {
 	st := styleOf(f.Path)
 	byKey := map[int]*Group{}
 	var lines []string
-	inText := multiline(f.Path, f.Data)
+	var blocks map[int]string
+	inText, inCode := multiline(f.Path, f.Data)
 	if len(inText) > 0 {
 		// definitions the outline found inside a docstring or a template aren't real
 		var keep []outline.Symbol
@@ -111,6 +113,9 @@ func Build(f *search.File, p *search.Pattern) *File {
 					si = d // in the doc comment of the definition below
 				}
 			}
+			if l == "string" && within(h.Spans, inCode[h.Line]) {
+				l = "" // code in a template's ${…}
+			}
 			g := groupFor(out, byKey, si)
 			g.Hits = append(g.Hits, Hit{Hit: h, Label: l})
 			continue
@@ -132,36 +137,53 @@ func Build(f *search.File, p *search.Pattern) *File {
 		if field != "" {
 			hit.Label = "definition"
 			out.Defs = append(out.Defs, Def{Kind: "field", Name: g.Name + "." + field,
-				Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line})
+				Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line, First: h.Line})
 		} else if si >= 0 && isDef(out.Syms[si], h, p) {
 			hit.Label = "definition"
 			s := out.Syms[si]
-			out.Defs = append(out.Defs, Def{Kind: s.Kind, Name: g.Name, Sig: s.Sig, Line: s.Line, End: s.End, Outline: true})
+			out.Defs = append(out.Defs, Def{Kind: s.Kind, Name: g.Name, Sig: s.Sig, Line: s.Line, End: s.End, First: s.Line, Outline: true})
 		} else {
 			hit.Label = classify(h, st)
 			// a definition by keyword, or a variable declared outside any
 			// definition (module level), defines what was searched for
-			if hit.Label == "definition" || si < 0 && topLevelDecl(h, hit.Label, st) {
-				out.Defs = append(out.Defs, Def{Kind: declKind(h), Name: h.Text[h.Spans[0][0]:h.Spans[0][1]], Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line})
+			if blocks == nil {
+				if lines == nil {
+					lines = strings.Split(string(f.Data), "\n")
+				}
+				blocks = goBlocks(f.Path, lines)
+				if blocks == nil {
+					blocks = map[int]string{}
+				}
+			}
+			if len(h.Spans) == 0 { // an empty match (limit|) names nothing
+				g.Hits = append(g.Hits, hit)
+				continue
+			}
+			a, b := widen(h.Text, h.Spans[0][0], h.Spans[0][1])
+			if k := blocks[h.Line]; k != "" && si < 0 && strings.TrimSpace(h.Text[:a]) == "" {
+				hit.Label = "definition" // a member of a var ( … ) or const ( … ) block
+				out.Defs = append(out.Defs, Def{Kind: k, Name: h.Text[a:b], Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line, First: h.Line})
+			} else if hit.Label == "definition" || si < 0 && topLevelDecl(h, hit.Label, st) {
+				out.Defs = append(out.Defs, Def{Kind: declKind(h), Name: h.Text[a:b], Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line, First: h.Line})
 			}
 		}
 		g.Hits = append(g.Hits, hit)
 	}
-	// a hit in a doc comment: the group starts where the comment does
-	for _, g := range out.Groups {
-		if g.Sym < 0 {
-			continue
+	// a definition's range starts at its doc comment, the same in every view
+	if len(out.Groups) > 0 && out.Outlined {
+		if lines == nil {
+			lines = strings.Split(string(f.Data), "\n")
 		}
-		for _, h := range g.Hits {
-			if h.Line < g.Line {
-				if lines == nil {
-					lines = strings.Split(string(f.Data), "\n")
+		for _, g := range out.Groups {
+			if g.Sym >= 0 {
+				if d := docStart(lines, g.Line, st, inText); d < g.Line {
+					g.Doc = d
 				}
-				g.Doc = h.Line
-				for k := h.Line - 1; k >= 1 && k <= len(lines) && (commentLine(lines[k-1], st) || decorator(lines[k-1]) || inText[k] == "comment" || strings.HasPrefix(strings.TrimSpace(lines[k-1]), "/*")); k-- {
-					g.Doc = k
-				}
-				break
+			}
+		}
+		for i := range out.Defs {
+			if d := &out.Defs[i]; d.Outline {
+				d.First = docStart(lines, d.Line, st, inText)
 			}
 		}
 	}
@@ -279,24 +301,27 @@ func reparent(syms []outline.Symbol) []outline.Symbol {
 // Python's triple-quoted strings (docstrings), backtick strings in
 // JavaScript, TypeScript and Go, and /* … */ comments in C-like languages.
 // The opening line isn't labelled (code may come before the mark); the
-// lines after it up to the closing one are.
-func multiline(path string, data []byte) map[int]string {
+// lines after it up to the closing one are. The second map holds the
+// ${…} parts of those lines in a template literal, which are code.
+func multiline(path string, data []byte) (map[int]string, map[int][][2]int) {
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
 	type mark struct{ open, close, label string }
 	block := mark{"/*", "*/", "comment"}
 	var marks []mark
-	hash := false
+	hash, jsLike := false, false
 	switch ext {
 	case "py", "pyi":
 		marks, hash = []mark{{`"""`, `"""`, "string"}, {`'''`, `'''`, "string"}}, true
 	case "js", "mjs", "cjs", "ts", "tsx", "jsx", "mts", "cts", "go":
 		marks = []mark{{"`", "`", "string"}, block}
+		jsLike = ext != "go"
 	case "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "java", "cs", "rs", "kt", "kts", "scala", "swift", "css", "scss", "less", "php", "dart", "zig", "glsl", "wgsl", "hlsl":
 		marks = []mark{block}
 	default:
-		return nil
+		return nil, nil
 	}
 	var in map[int]string
+	var code map[int][][2]int
 	var open *mark
 	n := 0
 	for len(data) > 0 {
@@ -319,6 +344,17 @@ func multiline(path string, data []byte) map[int]string {
 				switch {
 				case s[i] == '\\' && open.open == "`":
 					i += 2
+				case open.open == "`" && jsLike && strings.HasPrefix(s[i:], "${"):
+					end := interpEnd(s, i+2)
+					if end < 0 {
+						i += 2
+						continue
+					}
+					if code == nil {
+						code = map[int][][2]int{}
+					}
+					code[n] = append(code[n], [2]int{i + 2, end})
+					i = end + 1
 				case strings.HasPrefix(s[i:], open.close):
 					i += len(open.close)
 					open = nil
@@ -333,6 +369,12 @@ func multiline(path string, data []byte) map[int]string {
 			if s[i] == '\\' {
 				i += 2
 				continue
+			}
+			if s[i] == '/' && jsLike && i+1 < len(s) && s[i+1] != '/' && s[i+1] != '*' && regexStart(s[:i]) {
+				if end := regexEnd(s, i); end > 0 {
+					i = end // a regex literal: its quotes and backticks open nothing
+					continue
+				}
 			}
 			found := false
 			for k := range marks {
@@ -359,7 +401,122 @@ func multiline(path string, data []byte) map[int]string {
 			i++
 		}
 	}
+	return in, code
+}
+
+// interpEnd is the index of the } that closes a ${ whose contents start at
+// s[i], or -1 if it doesn't close on this line.
+func interpEnd(s string, i int) int {
+	depth := 0
+	for ; i < len(s); i++ {
+		switch s[i] {
+		case '{':
+			depth++
+		case '}':
+			if depth == 0 {
+				return i
+			}
+			depth--
+		}
+	}
+	return -1
+}
+
+// within: every span lies inside one of the ranges.
+func within(spans, ranges [][2]int) bool {
+	if len(spans) == 0 || len(ranges) == 0 {
+		return false
+	}
+	for _, sp := range spans {
+		in := false
+		for _, r := range ranges {
+			if sp[0] >= r[0] && sp[1] <= r[1] {
+				in = true
+				break
+			}
+		}
+		if !in {
+			return false
+		}
+	}
+	return true
+}
+
+// docStart is the first line of the comment and decorator block directly
+// above line n (n itself if there is none).
+func docStart(lines []string, n int, st style, inText map[int]string) int {
+	first := n
+	for k := n - 1; k >= 1 && k <= len(lines) && n-k <= 200; k-- {
+		l := lines[k-1]
+		if !commentLine(l, st) && !decorator(l) && inText[k] != "comment" && !strings.HasPrefix(strings.TrimSpace(l), "/*") {
+			break
+		}
+		first = k
+	}
+	return first
+}
+
+// goBlocks marks the lines inside top-level var ( … ) and const ( … )
+// blocks of a Go file with "var" or "const".
+func goBlocks(path string, lines []string) map[int]string {
+	if !strings.HasSuffix(path, ".go") {
+		return nil
+	}
+	var in map[int]string
+	kind := ""
+	for i, l := range lines {
+		switch {
+		case kind == "" && (l == "var (" || l == "const ("):
+			kind = strings.TrimSuffix(l, " (")
+		case kind != "" && strings.HasPrefix(l, ")"):
+			kind = ""
+		case kind != "":
+			if in == nil {
+				in = map[int]string{}
+			}
+			in[i+1] = kind
+		}
+	}
 	return in
+}
+
+// regexStart: a slash after this JavaScript code starts a regex literal,
+// not a division (it follows an operator, an opening bracket, or nothing).
+func regexStart(code string) bool {
+	t := strings.TrimRight(code, " \t")
+	if t == "" {
+		return true
+	}
+	if strings.ContainsRune("(,=:[!&|?{};+-*%<>~^", rune(t[len(t)-1])) {
+		return true
+	}
+	for _, kw := range []string{"return", "typeof", "case", "in", "of", "delete", "void", "yield", "await"} {
+		if strings.HasSuffix(t, kw) && (len(t) == len(kw) || !isWord(t[len(t)-len(kw)-1])) {
+			return true
+		}
+	}
+	return false
+}
+
+// regexEnd is the index after a regex literal that starts at s[i] ('/'),
+// or -1 if it doesn't close on this line.
+func regexEnd(s string, i int) int {
+	class := false
+	for j := i + 1; j < len(s); j++ {
+		switch s[j] {
+		case '\\':
+			j++
+		case '[':
+			class = true
+		case ']':
+			class = false
+		case '/':
+			if !class {
+				return j + 1
+			}
+		}
+	}
+	return -1
 }
 
 // innermost is the deepest symbol whose lines contain n, or -1.
@@ -389,6 +546,7 @@ type style struct {
 	block    bool     // /* … */ (and "*" continuation lines)
 	quotes   string
 	code     bool // source code (not data, docs or prose): keywords define names
+	js       bool // JavaScript and TypeScript: /…/ regex literals
 	typed    bool // declarations put the type before the name (Java, C#, C, C++)
 	fstrings bool // Python f-strings interpolate {…}
 }
@@ -396,7 +554,7 @@ type style struct {
 var (
 	slashStyle = style{line: []string{"//"}, block: true, quotes: "\"`", code: true}
 	typedStyle = style{line: []string{"//"}, block: true, quotes: "\"", code: true, typed: true}
-	jsStyle    = style{line: []string{"//"}, block: true, quotes: "\"'`", code: true}
+	jsStyle    = style{line: []string{"//"}, block: true, quotes: "\"'`", code: true, js: true}
 	hashStyle  = style{line: []string{"#"}, quotes: "\"'", code: true}
 	pyStyle    = style{line: []string{"#"}, quotes: "\"'", code: true, fstrings: true}
 	confStyle  = style{line: []string{"#"}, quotes: "\"'"} // YAML, TOML, INI: data
@@ -528,6 +686,14 @@ func inString(before string, st style) bool {
 			}
 			continue
 		}
+		if c == '/' && st.js && i+1 < len(before) && before[i+1] != '/' && before[i+1] != '*' && regexStart(before[:i]) {
+			end := regexEnd(before, i)
+			if end < 0 {
+				return true // the match is inside the regex literal
+			}
+			i = end - 1
+			continue
+		}
 		if c == '\'' && strings.IndexByte(st.quotes, '\'') < 0 {
 			// a character literal: 'x', '\n', '"' (Rust lifetimes have no closing quote)
 			if i+2 < len(before) && before[i+2] == '\'' {
@@ -605,17 +771,34 @@ func isDef(s outline.Symbol, h search.Hit, p *search.Pattern) bool {
 	if p.DefMode && !p.Smart {
 		return true
 	}
-	name := lastPart(s.Name)
+	names := []string{lastPart(s.Name)}
+	if s.Kind == "impl" { // impl Shape for Grid<'a>: defines Shape for Grid
+		trait, typ, ok := strings.Cut(s.Name, " for ")
+		if !ok {
+			trait, typ = s.Name, ""
+		}
+		names = []string{bare(trait), bare(typ)}
+	}
 	for _, sp := range h.Spans {
 		a, b := sp[0], sp[1]
 		if !p.Smart {
 			a, b = widen(h.Text, a, b)
 		}
-		if strings.EqualFold(lastPart(h.Text[a:b]), name) {
-			return true
+		for _, name := range names {
+			if name != "" && strings.EqualFold(lastPart(h.Text[a:b]), name) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// bare is a type's name without its path and generics: fmt::Display → Display.
+func bare(t string) string {
+	if i := strings.IndexByte(t, '<'); i >= 0 {
+		t = t[:i]
+	}
+	return lastPart(strings.TrimSpace(t))
 }
 
 func inComment(before, trimmed string, st style) bool {

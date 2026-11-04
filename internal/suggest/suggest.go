@@ -20,6 +20,7 @@ type Name struct {
 	Word  string
 	Count int      // occurrences
 	Paths []string // the files it occurs in
+	Line  int      // its first line in Paths[0]
 	score int
 }
 
@@ -28,6 +29,7 @@ var tokenRe = regexp.MustCompile(`[\p{L}_$][\p{L}\p{N}_$]*`)
 type stat struct {
 	count int
 	paths []string
+	first map[string]int // the first line it's on, per file
 }
 
 // Similar returns up to limit names similar to any of words, best first.
@@ -43,7 +45,7 @@ func Similar(words []string, paths []string, limit int, fold bool) []Name {
 			}
 		}
 		if best > 0 {
-			out = append(out, Name{Word: tok, Count: st.count, Paths: st.paths, score: best})
+			out = append(out, Name{Word: tok, Count: st.count, Paths: st.paths, Line: st.first[st.paths[0]], score: best})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -100,6 +102,10 @@ func tokens(paths []string) map[string]*stat {
 					if !seen[t] {
 						seen[t] = true
 						st.paths = append(st.paths, p)
+						if st.first == nil {
+							st.first = map[string]int{}
+						}
+						st.first[p] = line
 					}
 				}
 			}
@@ -112,6 +118,9 @@ func tokens(paths []string) map[string]*stat {
 				}
 				a.count += st.count
 				a.paths = append(a.paths, st.paths...)
+				for p, l := range st.first {
+					a.first[p] = l
+				}
 			}
 			mu.Unlock()
 		}()

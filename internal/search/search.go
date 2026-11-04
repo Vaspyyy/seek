@@ -30,8 +30,11 @@ type Pattern struct {
 	// DefMode: looking for definitions (-d); with a regex, a match anywhere
 	// on a definition's first line finds it
 	DefMode bool
-	need    [][]byte        // a match contains one of these (nil: no such literal)
-	words   map[string]bool // many whole words: found by splitting lines into words
+	need    [][]byte // a match contains one of these (nil: no such literal)
+	fold    bool     // need is lowercase: look for it in a lowercased copy
+	// Empty: the pattern matches the empty string, so every line
+	Empty bool
+	words map[string]bool // many whole words: found by splitting lines into words
 }
 
 // Options say how to read a pattern.
@@ -66,7 +69,12 @@ func Compile(expr string, o Options) (*Pattern, error) {
 		p.Words = alts
 		var parts []string
 		for _, a := range alts {
-			q := regexp.QuoteMeta(a)
+			// a dot stays a regex dot (lim.t finds limit, Repo.Open finds
+			// Repo.Open); only $ is taken literally ($scope)
+			q := strings.ReplaceAll(regexp.QuoteMeta(a), `\.`, `.`)
+			if o.Fixed {
+				q = regexp.QuoteMeta(a)
+			}
 			if !o.Partial {
 				// \b knows only ASCII letters; boundaries next to other
 				// letters are checked on each match (wholeWord)
@@ -94,6 +102,7 @@ func Compile(expr string, o Options) (*Pattern, error) {
 	if o.Words && !p.Smart {
 		src = `\b(?:` + src + `)\b`
 	}
+	plain := src // without (?i): its literals are the prefilter
 	if o.IgnoreCase {
 		src = "(?i)" + src
 	}
@@ -103,6 +112,7 @@ func Compile(expr string, o Options) (*Pattern, error) {
 	}
 	p.Re = re
 	p.file = regexp.MustCompile("(?m)" + src)
+	p.Empty = re.MatchString("")
 	p.Names = p.Words
 	if p.Names == nil {
 		p.Names = namesIn(expr, o.Fixed || p.Bad != "")
@@ -122,12 +132,43 @@ func Compile(expr string, o Options) (*Pattern, error) {
 		}
 		return p, nil
 	}
-	if !o.IgnoreCase {
-		if sre, err := syntax.Parse(src, syntax.Perl); err == nil {
-			p.need = required(sre.Simplify())
+	if sre, err := syntax.Parse(plain, syntax.Perl); err == nil {
+		p.need = required(sre.Simplify())
+		if o.IgnoreCase {
+			// with -i, the literals are looked for in an ASCII-lowercased copy;
+			// letters outside ASCII can't be folded that way, so no prefilter
+			for i, l := range p.need {
+				if !isASCII(l) {
+					p.need = nil
+					break
+				}
+				p.need[i] = asciiLower(l)
+			}
+			p.fold = p.need != nil
 		}
 	}
 	return p, nil
+}
+
+func isASCII(b []byte) bool {
+	for _, c := range b {
+		if c >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// asciiLower lowercases A-Z only, so offsets stay the same.
+func asciiLower(b []byte) []byte {
+	out := make([]byte, len(b))
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		out[i] = c
+	}
+	return out
 }
 
 // required returns literals one of which every match contains, or nil if
@@ -436,12 +477,16 @@ func searchFile(path string, p *Pattern) (*File, string) {
 		return nil, skip
 	}
 	var hits []Hit
+	in := data // where the prefilter looks
+	if p.fold && p.words == nil {
+		in = asciiLower(data)
+	}
 	if p.words != nil {
 		hits = wordLines(data, p.words, p.Fold)
-	} else if !p.mayMatch(data) {
+	} else if !p.mayMatch(in) {
 		return nil, ""
 	} else if p.need != nil && shortest(p.need) >= 2 {
-		hits = candidateLines(data, p.Re, p.need)
+		hits = candidateLines(data, in, p.Re, p.need)
 	} else {
 		hits = lines(data, p.file, p.Re)
 	}
@@ -508,11 +553,11 @@ func lines(data []byte, fileRe, re *regexp.Regexp) []Hit {
 // candidateLines matches re only on the lines that contain one of the
 // required literals, found with bytes.Index: much faster than running the
 // regex over the whole file when it can't skip ahead on its own.
-func candidateLines(data []byte, re *regexp.Regexp, need [][]byte) []Hit {
+func candidateLines(data, in []byte, re *regexp.Regexp, need [][]byte) []Hit {
 	starts := map[int]bool{}
 	for _, lit := range need {
-		for pos := 0; pos < len(data); {
-			i := bytes.Index(data[pos:], lit)
+		for pos := 0; pos < len(in); {
+			i := bytes.Index(in[pos:], lit)
 			if i < 0 {
 				break
 			}

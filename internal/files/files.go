@@ -33,11 +33,45 @@ var skipDirs = map[string]bool{
 // out (git doesn't list their files); set by List.
 var Nested []string
 
+var (
+	skipped  []string // folders the walk left out (caches, dot-folders)
+	gitRoots []string // roots whose files came from git
+)
+
+// Skipped lists what List left out by default: files and folders git
+// ignores, and caches and dot-folders outside a repository (at most max).
+func Skipped(max int) []string {
+	out := append([]string(nil), skipped...)
+	for _, root := range gitRoots {
+		if len(out) >= max {
+			break
+		}
+		cmd := exec.Command("git", "-C", root, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory")
+		b, err := cmd.Output()
+		if err != nil {
+			continue
+		}
+		for _, f := range bytes.Split(b, []byte{0}) {
+			if len(f) > 0 && len(out) < max {
+				name := filepath.Join(root, string(f))
+				if bytes.HasSuffix(f, []byte("/")) {
+					name += "/" // a folder
+				}
+				out = append(out, name)
+			}
+		}
+	}
+	if len(out) > max {
+		out = out[:max]
+	}
+	return out
+}
+
 // List returns the files below roots (files or directories), as paths
 // joined to the root they were found under, sorted. Roots that are files
 // are always included.
 func List(roots []string, o Options) ([]string, error) {
-	Nested = nil
+	Nested, skipped, gitRoots = nil, nil, nil
 	if len(roots) == 0 {
 		roots = []string{"."}
 	}
@@ -74,7 +108,10 @@ func List(roots []string, o Options) ([]string, error) {
 
 func walk(root string, o Options, add func(string, bool)) error {
 	if !o.Unrestrict {
-		if ps, ok := gitFiles(root); ok {
+		// a folder git ignores, named on the command line, is searched
+		// anyway (as rg does): then git lists nothing and the walk below runs
+		if ps, ok := gitFiles(root); ok && len(ps) > 0 {
+			gitRoots = append(gitRoots, root)
 			for _, p := range ps {
 				st, err := os.Lstat(filepath.Join(root, p))
 				switch {
@@ -100,6 +137,9 @@ func walk(root string, o Options, add func(string, bool)) error {
 				return nil
 			}
 			if name == ".git" || !o.Unrestrict && (skipDirs[name] || strings.HasPrefix(name, ".")) {
+				if name != ".git" && len(skipped) < 50 {
+					skipped = append(skipped, p+"/")
+				}
 				return filepath.SkipDir
 			}
 			if !o.Unrestrict {

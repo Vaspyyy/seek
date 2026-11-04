@@ -38,15 +38,17 @@ words only. An invalid regex is searched as plain text.
   -d          definitions only: where PATTERN is defined, one line each
   -s          show the whole definition around each hit (windows in long ones)
   -c          counts: at most one line per definition
-  -l          only the paths of files with hits (-0: separated by NUL bytes)
-  -C N        N lines of context around each hit
+  -l          only the paths of files with hits (-0: separated by NUL bytes;
+              with -d, the files that define it)
+  -C N        N lines of context around each hit (with -s: the window size)
   -i          ignore case
   -F          plain text, not a regex
   -w          whole words, also for a regex
   --partial   identifiers also inside longer words (speed finds speedMult)
+  --writes    only hits that set the name: definitions, declarations, assignments
   -g GLOB     only files matching GLOB ("*.js", "src/**", "!*_test.go"); repeatable
   -u          also ignored files, caches and dot-folders
-  -b N        about how many lines to print (default 100, with -s 300)
+  -b N        about how many lines to print (default 100, with -s 300; 0: no limit)
   -e PATTERN  a pattern that starts with "-"
   -A          plain output without colors (the default when not on a terminal)
   --version
@@ -65,6 +67,7 @@ type options struct {
 	budgetSet                  bool
 	so                         search.Options
 	plain, unrestrict, null    bool
+	writes                     bool
 }
 
 func main() {
@@ -104,8 +107,20 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	}
 	found, st := search.Run(paths, p)
 	gs := buildAll(found, p)
+	if o.writes {
+		gs = writesOnly(gs)
+	}
+	if o.list && o.defs {
+		gs = definingFiles(o, p, gs)
+	}
 	if o.list {
 		sort.Slice(gs, func(i, j int) bool { return gs[i].Path < gs[j].Path })
+		// notes go to stderr, so the paths can be piped
+		if len(gs) == 0 {
+			fmt.Fprintf(errw, "seek: %s: no hits (without -l, seek suggests what would match)\n", describe(p))
+		} else if m := missed(o, p, paths, countHits(gs)); m.lines > 0 && !o.defs {
+			fmt.Fprintln(errw, "seek: "+m.note(o.pattern))
+		}
 		end := "\n"
 		if o.null {
 			end = "\x00"
@@ -117,6 +132,9 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	}
 	render.Order(gs)
 	budget := o.budget
+	if o.budgetSet && budget == 0 {
+		budget = 1 << 30 // -b 0: no limit
+	}
 	if !o.budgetSet {
 		budget = 100
 		if o.bodies {
@@ -134,7 +152,7 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	}
 	if hits == 0 {
 		fmt.Fprintf(out, "seek: %s in %s: no hits\n", describe(p), scope)
-		skipped(out, o, true)
+		skipped(out, o, st, true)
 		hints(out, o, p, paths)
 		return 1
 	}
@@ -147,21 +165,40 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 		head += "; defined at " + d
 	}
 	fmt.Fprintln(out, head)
+	if m := missed(o, p, paths, hits); m.lines > 0 {
+		fmt.Fprintln(out, m.note(o.pattern)) // first, where it can't be overlooked
+	}
 	render.Print(out, gs, layout, ro)
-	notes(out, o, p, paths, hits, layout, gs, ro)
-	skipped(out, o, false)
+	notes(out, layout, gs, ro)
+	skipped(out, o, st, false)
 	return 0
 }
 
 // skipped says which files named on the command line weren't searched
-// (binary, too big), and, when nothing was found, the nested repositories
-// that weren't searched.
-func skipped(out *bufio.Writer, o options, none bool) {
+// (binary, too big), and, when nothing was found, the binary files, ignored
+// folders and nested repositories that weren't searched.
+func skipped(out *bufio.Writer, o options, st search.Stats, none bool) {
+	binary := st.Binary
 	for _, path := range o.paths {
 		if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
 			if _, why := search.Read(path); why != "" {
 				fmt.Fprintf(out, "  not searched: %s is %s\n", path, why)
+				if why == "binary" {
+					binary--
+				}
 			}
+		}
+	}
+	if none && binary > 0 {
+		fmt.Fprintf(out, "  not searched: %s\n", plural(binary, "binary file"))
+	}
+	if none && !o.unrestrict {
+		if sk := files.Skipped(6); len(sk) > 0 {
+			more := ""
+			if len(sk) == 6 {
+				sk, more = sk[:5], ", …"
+			}
+			fmt.Fprintf(out, "  not searched: %s%s (ignored by git, caches or dot-folders; -u searches them)\n", strings.Join(sk, ", "), more)
 		}
 	}
 	if n := len(files.Nested); n > 0 && none {
@@ -174,60 +211,71 @@ func skipped(out *bufio.Writer, o options, none bool) {
 	}
 }
 
-// notes end the output with what it doesn't show: hits inside longer
-// words, and what the budget left out of -s and -C.
-func notes(out *bufio.Writer, o options, p *search.Pattern, paths []string, hits int, l *render.Layout, gs []*group.File, ro render.Options) {
-	if n, words := longer(o, p, paths, hits); n > 0 {
-		cmd := command("--partial ", o.pattern)
-		if cmd != "" {
-			cmd = ": " + cmd
-		}
-		fmt.Fprintf(out, "+%s inside longer words (%s)%s\n", plural(n, "more hit"), words, cmd)
-	}
+// notes end the output with what the budget left out of -s and -C.
+func notes(out *bufio.Writer, l *render.Layout, gs []*group.File, ro render.Options) {
 	if reduced, total := l.Reduced(gs, ro); reduced > 0 {
-		what := "less than their whole definitions"
+		flag, what := "-s", "show only part of their definitions"
 		if !ro.Bodies {
-			what = "no context lines"
+			flag, what = "-C", "show their hits without context"
 		}
-		fmt.Fprintf(out, "(%d of %s with %s, to stay within the budget: raise -b, e.g. -b %d)\n", reduced, plural(total, "file"), what, max(ro.Budget*2, 300))
+		if reduced == 1 {
+			what = strings.Replace(strings.Replace(what, "show ", "shows ", 1), "their", "its", 1)
+		}
+		fmt.Fprintf(out, "(%s: %d of %s %s to fit the budget; raise -b, e.g. -b %d, or -b 0 for no limit)\n",
+			flag, reduced, plural(total, "file"), what, max(ro.Budget*2, 300))
 	}
 }
 
-// longer is what a whole-word search left out: the lines that match only
-// inside longer words, and the most frequent of those words.
-func longer(o options, p *search.Pattern, paths []string, wholeLines int) (int, string) {
+// missed is what a whole-word, case-sensitive search left out: the lines
+// that match only in another case or inside longer words, the most
+// frequent of those words, and the flags that would include them.
+type missedHits struct {
+	lines        int
+	words, flags string
+	what         string // "in other case", "inside longer words" or both
+}
+
+func missed(o options, p *search.Pattern, paths []string, wholeLines int) missedHits {
 	if !p.Smart || len(p.Words) > 16 {
-		return 0, ""
+		return missedHits{}
 	}
 	so := o.so
-	so.Partial = true
+	so.Partial, so.IgnoreCase = true, true
 	q, err := search.Compile(o.pattern, so)
 	if err != nil {
-		return 0, ""
+		return missedHits{}
 	}
 	found, _ := search.Run(paths, q)
 	lines := 0
 	counts := map[string]int{}
-	whole := map[string]bool{}
+	exact := map[string]bool{}
 	for _, w := range p.Words {
-		whole[strings.ToLower(lastPart(w))] = true
+		exact[lastPart(w)] = true
 	}
+	longer, cased := false, false
 	for _, f := range found {
 		lines += len(f.Hits)
 		for _, h := range f.Hits {
 			seen := map[string]bool{}
 			for _, s := range h.Spans {
 				w := wordAt(h.Text, s[0], s[1])
-				if !whole[strings.ToLower(w)] && !seen[w] {
-					seen[w] = true
-					counts[w]++
+				if exact[w] || seen[w] {
+					continue
+				}
+				seen[w] = true
+				counts[clipWord(w)]++
+				if len(w) > s[1]-s[0] {
+					longer = true
+				}
+				if !p.Fold && !exact[h.Text[s[0]:s[1]]] {
+					cased = true
 				}
 			}
 		}
 	}
 	extra := lines - wholeLines
 	if extra <= 0 || len(counts) == 0 {
-		return 0, ""
+		return missedHits{}
 	}
 	type wc struct {
 		w string
@@ -245,7 +293,24 @@ func longer(o options, p *search.Pattern, paths []string, wholeLines int) (int, 
 	if len(ws) > 4 {
 		parts = append(parts, fmt.Sprintf("+%d more", len(ws)-4))
 	}
-	return extra, strings.Join(parts, ", ")
+	m := missedHits{lines: extra, words: strings.Join(parts, ", ")}
+	switch {
+	case cased && longer:
+		m.what, m.flags = "in another case or inside longer words", "-i --partial "
+	case cased:
+		m.what, m.flags = "in another case", "-i "
+	default:
+		m.what, m.flags = "inside longer words", "--partial "
+	}
+	return m
+}
+
+func (m missedHits) note(pattern string) string {
+	s := fmt.Sprintf("+%s %s (%s)", plural(m.lines, "more hit"), m.what, m.words)
+	if cmd := command(m.flags, pattern); cmd != "" {
+		s += ": " + cmd
+	}
+	return s
 }
 
 // command is a seek command line to suggest, or "" if the pattern is too
@@ -280,6 +345,58 @@ func buildAll(found []*search.File, p *search.Pattern) []*group.File {
 	return gs
 }
 
+// writesOnly keeps the hits that set the name: definitions, declarations
+// and assignments.
+func writesOnly(gs []*group.File) []*group.File {
+	var out []*group.File
+	for _, f := range gs {
+		c := *f
+		c.Groups = nil
+		for _, g := range f.Groups {
+			var hs []group.Hit
+			for _, h := range g.Hits {
+				if h.Label == "definition" || h.Label == "declaration" || h.Label == "assignment" {
+					hs = append(hs, h)
+				}
+			}
+			if len(hs) > 0 {
+				ng := *g
+				ng.Hits = hs
+				c.Groups = append(c.Groups, &ng)
+			}
+		}
+		if len(c.Groups) > 0 {
+			out = append(out, &c)
+		}
+	}
+	return out
+}
+
+func countHits(gs []*group.File) int {
+	n := 0
+	for _, f := range gs {
+		n += f.Count()
+	}
+	return n
+}
+
+// definingFiles keeps the files that define the pattern (for -l -d).
+func definingFiles(o options, p *search.Pattern, gs []*group.File) []*group.File {
+	want := strings.Split(o.pattern, "|")
+	var out []*group.File
+	for _, f := range gs {
+		for _, d := range f.Defs {
+			name := d.Name
+			if t, typ, ok := strings.Cut(name, " for "); ok && (keepName(t, want, p.Fold) || keepName(typ, want, p.Fold)) ||
+				!p.Smart || keepName(name, want, p.Fold) {
+				out = append(out, f)
+				break
+			}
+		}
+	}
+	return out
+}
+
 func exitCode(found bool) int {
 	if found {
 		return 0
@@ -312,12 +429,19 @@ func describe(p *search.Pattern) string {
 		notes = append(notes, "look-around and backreferences aren't supported (rg -P has them); searched as text")
 	case p.Bad != "":
 		notes = append(notes, "not a valid regex ("+p.Bad+"), searched as text")
+	case p.Smart && p.Text:
+		notes = append(notes, "text, whole word")
 	case p.Smart && len(p.Words) > 1:
 		notes = append(notes, "whole words")
 	case p.Smart:
 		notes = append(notes, "whole word")
 	case p.Text:
 		notes = append(notes, "text")
+	case len(p.Words) > 0:
+		notes = append(notes, "also inside longer words")
+	}
+	if p.Empty {
+		notes = append(notes, "matches the empty string, so every line")
 	}
 	if p.Fold {
 		notes = append(notes, "ignoring case")
@@ -340,10 +464,7 @@ func scopeOf(o options, st search.Stats) string {
 		where = strings.Join(o.paths, " ") + ", "
 	}
 	if len(o.globs) > 0 {
-		n = fmt.Sprintf("%d %s files", st.Files, strings.Join(o.globs, " "))
-		if st.Files == 1 {
-			n = fmt.Sprintf("1 %s file", strings.Join(o.globs, " "))
-		}
+		n = fmt.Sprintf("%s matching %s", plural(st.Files, "file"), strings.Join(o.globs, " "))
 	}
 	s := where + n
 	if st.TooBig > 0 {
@@ -385,6 +506,15 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 		if !p.Smart {
 			return true
 		}
+		// impl Shape for Grid defines Shape for Grid: it answers -d Shape
+		if trait, typ, ok := strings.Cut(name, " for "); ok {
+			if keepName(trait, want, p.Fold) || keepName(typ, want, p.Fold) {
+				return true
+			}
+		}
+		if i := strings.IndexByte(name, '<'); i > 0 {
+			name = name[:i] // impl Stack<T>: Stack
+		}
 		for _, w := range want {
 			if name == w || strings.HasSuffix(name, "."+w) || strings.HasSuffix(name, "::"+w) ||
 				p.Fold && (strings.EqualFold(name, w) || strings.HasSuffix(strings.ToLower(name), "."+strings.ToLower(w))) {
@@ -418,7 +548,10 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 		if (a.Kind == "") != (b.Kind == "") {
 			return a.Kind == ""
 		}
-		return outlined(a) && !outlined(b)
+		if outlined(a) != outlined(b) {
+			return outlined(a)
+		}
+		return ownDef(a) && !ownDef(b) // the trait or type itself, then its impls
 	})
 	have := map[string]bool{}
 	for _, f := range defFiles {
@@ -437,7 +570,7 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 		}
 		fmt.Fprintln(out)
 		if c := containing(o, p, paths, have); c != "" {
-			fmt.Fprintln(out, "  definitions containing it: "+c)
+			fmt.Fprintln(out, "  definitions whose names contain it: "+c)
 		} else if others == 0 {
 			hints(out, o, p, paths)
 		}
@@ -452,7 +585,7 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 	if o.bodies {
 		render.Files(out, defFiles, ro)
 		if more != "" {
-			fmt.Fprintln(out, "definitions containing it: "+more)
+			fmt.Fprintln(out, "definitions whose names contain it: "+more)
 		}
 		return 0
 	}
@@ -463,8 +596,12 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 				fmt.Fprintf(out, "… %s (raise -b)\n", plural(total-shown, "more definition"))
 				return 0
 			}
-			rng := strconv.Itoa(d.Line)
-			if d.End > d.Line {
+			first := d.Line
+			if d.First > 0 && d.First < first {
+				first = d.First // the range starts at the doc comment, as in the other views
+			}
+			rng := strconv.Itoa(first)
+			if d.End > first {
 				rng += "-" + strconv.Itoa(d.End)
 			}
 			kind := ""
@@ -476,9 +613,32 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 		}
 	}
 	if more != "" {
-		fmt.Fprintln(out, "definitions containing it: "+more)
+		fmt.Fprintln(out, "definitions whose names contain it: "+more)
 	}
 	return 0
+}
+
+// keepName: name (possibly qualified, possibly with generics) is one of want.
+func keepName(name string, want []string, fold bool) bool {
+	if i := strings.IndexByte(name, '<'); i > 0 {
+		name = name[:i]
+	}
+	name = strings.TrimSpace(name)
+	for _, w := range want {
+		if lastPart(name) == lastPart(w) || fold && strings.EqualFold(lastPart(name), lastPart(w)) {
+			return true
+		}
+	}
+	return false
+}
+
+func ownDef(f *group.File) bool {
+	for _, d := range f.Defs {
+		if d.Kind != "impl" {
+			return true
+		}
+	}
+	return false
 }
 
 func outlined(f *group.File) bool {
@@ -577,7 +737,7 @@ func hints(out *bufio.Writer, o options, p *search.Pattern, paths []string) {
 			hits += len(f.Hits)
 			for _, h := range f.Hits {
 				for _, s := range h.Spans {
-					w := wordAt(h.Text, s[0], s[1])
+					w := clipWord(wordAt(h.Text, s[0], s[1]))
 					if !seen[w] && len(words) < 4 {
 						seen[w] = true
 						words = append(words, w)
@@ -635,13 +795,13 @@ func hints(out *bufio.Writer, o options, p *search.Pattern, paths []string) {
 	fmt.Fprintln(out, "  similar names:")
 	for _, c := range keep {
 		n := c.n
-		where := n.Paths[0]
+		where := fmt.Sprintf("%s:%d", n.Paths[0], n.Line)
 		if c.def != "" {
 			where = "defined at " + c.def
 		} else if len(n.Paths) > 1 {
-			where = fmt.Sprintf("in %s, e.g. %s", plural(len(n.Paths), "file"), n.Paths[0])
+			where = fmt.Sprintf("in %s, e.g. %s:%d", plural(len(n.Paths), "file"), n.Paths[0], n.Line)
 		}
-		fmt.Fprintf(out, "    %s  %s, %s\n", n.Word, plural(n.Count, "hit"), where)
+		fmt.Fprintf(out, "    %s  %s, %s\n", clipWord(n.Word), plural(n.Count, "hit"), where)
 	}
 }
 
@@ -682,6 +842,15 @@ func firstDef(word string, paths []string) string {
 		}
 	}
 	return ""
+}
+
+// clipWord shortens a word for a note (a minified file's "word" can be
+// thousands of characters long).
+func clipWord(w string) string {
+	if r := []rune(w); len(r) > 40 {
+		return string(r[:39]) + "…"
+	}
+	return w
 }
 
 func lastPart(name string) string {
@@ -747,6 +916,8 @@ func parse(args []string) (options, int, string) {
 			return o, 0, "seek " + version + "\n"
 		case a == "--partial":
 			o.so.Partial = true
+		case a == "--writes":
+			o.writes = true
 		case a == "-e":
 			var s string
 			if s, msg = value(&i, "-e"); msg == "" {
@@ -819,20 +990,30 @@ func parse(args []string) (options, int, string) {
 	if o.pattern == "" {
 		return o, 2, "the pattern is empty"
 	}
-	for _, p := range rest {
+	for k, p := range rest {
 		if _, err := os.Stat(p); err != nil {
-			return o, 2, "no such file or folder: " + p
+			msg := "no such file or folder: " + p
+			if k == 0 && !strings.ContainsAny(p, "/.") {
+				msg += fmt.Sprintf(" (to search for several words, join them: '%s|%s')", o.pattern, p)
+			}
+			return o, 2, msg
 		}
 		o.paths = append(o.paths, filepath.Clean(p))
 	}
 	if o.null && !o.list {
 		return o, 2, "-0 separates the paths of -l with NUL bytes; use it with -l"
 	}
-	if o.list && (o.bodies || o.counts || o.defs) {
-		return o, 2, "-l prints only paths; it doesn't combine with -s, -c or -d"
+	if o.list && (o.bodies || o.counts) {
+		return o, 2, "-l prints only paths; it doesn't combine with -s or -c"
 	}
 	if o.bodies && o.counts {
 		return o, 2, "-s shows whole definitions and -c only counts; pick one"
+	}
+	if o.defs && o.counts {
+		return o, 2, "-d lists definitions one line each and -c counts hits; pick one"
+	}
+	if o.defs && o.context > 0 && !o.bodies {
+		return o, 2, "-d lists definitions one line each; -d -s shows their code"
 	}
 	return o, 0, ""
 }

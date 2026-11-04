@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/Vaspyyy/seek/internal/group"
+	"github.com/Vaspyyy/seek/internal/search"
 )
 
 // Options control the output.
@@ -294,7 +295,17 @@ func (w *writer) file(f *group.File, lv int) {
 			ind = "    "
 		}
 		common := commonIndent(g)
-		for _, l := range w.window(f, g, lv-3) {
+		shown := w.window(f, g, lv-3)
+		ctx := w.o.Context
+		for _, l := range shown {
+			if l.hit == nil && !l.gap {
+				ctx = max(ctx, 1) // context lines (block openers): mark hits with ":"
+				if lv == 3 && w.o.Context == 0 {
+					common = sharedIndent(common, l.text) // openers sit left of their hits
+				}
+			}
+		}
+		for _, l := range shown {
 			if l.gap {
 				w.line("%s%s%s…%s", ind, c.faint, strings.Repeat(" ", width-1), c.reset)
 				continue
@@ -305,9 +316,12 @@ func (w *writer) file(f *group.File, lv int) {
 				if shownLabel[l.hit.Label] {
 					text += "  " + c.label + "(" + l.hit.Label + ")" + c.reset
 				}
-				w.line("%s%s%*d%s%s %s", ind, c.faint, width, l.n, sep(':', lv, w.o.Context), c.reset, text)
+				w.line("%s%s%*d%s%s %s", ind, c.faint, width, l.n, sep(':', lv, ctx), c.reset, text)
 			} else {
-				w.line("%s", strings.TrimRight(fmt.Sprintf("%s%s%*d%s%s %s", ind, c.faint, width, l.n, sep('-', lv, w.o.Context), c.reset, clipLine(text, 300)), " "))
+				if lv == 3 && w.o.Context == 0 { // a block opener: shown like the hits
+					text = w.highlight(group.Hit{Hit: search.Hit{Text: text}}, false, common)
+				}
+				w.line("%s", strings.TrimRight(fmt.Sprintf("%s%s%*d%s%s %s", ind, c.faint, width, l.n, sep('-', lv, ctx), c.reset, clipLine(text, 300)), " "))
 			}
 		}
 	}
@@ -321,18 +335,23 @@ var shownLabel = map[string]bool{"comment": true, "string": true}
 func commonIndent(g *group.Group) string {
 	var common string
 	for k, h := range g.Hits {
-		ind := h.Text[:len(h.Text)-len(strings.TrimLeft(h.Text, " \t"))]
 		if k == 0 {
-			common = ind
+			common = h.Text[:len(h.Text)-len(strings.TrimLeft(h.Text, " \t"))]
 			continue
 		}
-		n := 0
-		for n < len(common) && n < len(ind) && common[n] == ind[n] {
-			n++
-		}
-		common = common[:n]
+		common = sharedIndent(common, h.Text)
 	}
 	return common
+}
+
+// sharedIndent is the part of common that line's indentation starts with.
+func sharedIndent(common, line string) string {
+	ind := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+	n := 0
+	for n < len(common) && n < len(ind) && common[n] == ind[n] {
+		n++
+	}
+	return common[:n]
 }
 
 // sep is grep's marker after a line number (":" for hits, "-" for
@@ -395,9 +414,20 @@ func (w *writer) groupCount(g *group.Group) string {
 		}
 	}
 	if len(parts) > 0 {
+		if n := len(g.Hits) - sumLabels(labels); n > 0 {
+			parts = append([]string{plural(n, "use")}, parts...)
+		}
 		s += " (" + strings.Join(parts, ", ") + ")"
 	}
 	return s + ": L" + joinCapped(ls, 8)
+}
+
+func sumLabels(m map[string]int) int {
+	n := 0
+	for _, v := range m {
+		n += v
+	}
+	return n
 }
 
 func labelCount(l string, n int) string {
@@ -430,10 +460,14 @@ func (w *writer) topGroups(f *group.File, n int) string {
 
 func labelCounts(f *group.File) string {
 	var parts []string
+	plainUses := f.Labelled("")
 	for _, l := range []string{"definition", "declaration", "assignment", "import", "comment", "string"} {
 		if n := f.Labelled(l); n > 0 {
 			parts = append(parts, labelCount(l, n))
 		}
+	}
+	if len(parts) > 0 && plainUses > 0 { // the counts add up to the total
+		parts = append([]string{plural(plainUses, "use")}, parts...)
 	}
 	return strings.Join(parts, ", ")
 }
@@ -446,6 +480,65 @@ type shownLine struct {
 	text string
 	hit  *group.Hit
 	gap  bool
+}
+
+// bigDef is the length above which a definition's hits also show the line
+// that opens the block they're in (the if, loop or callback around them).
+const bigDef = 150
+
+// withOpeners lists a big definition's hits, each after the nearest line
+// above it that is indented less (its block's first line), once.
+func withOpeners(f *group.File, g *group.Group, lines []string) []shownLine {
+	hits := map[int]bool{}
+	for _, h := range g.Hits {
+		hits[h.Line] = true
+	}
+	added := map[int]bool{}
+	var out []shownLine
+	for i := range g.Hits {
+		h := &g.Hits[i]
+		if o := opener(lines, h.Line, g.Line); o > 0 && !hits[o] && !added[o] {
+			added[o] = true
+			out = append(out, shownLine{n: o, text: lines[o-1]})
+		}
+		out = append(out, shownLine{n: h.Line, hit: h})
+	}
+	sort.SliceStable(out, func(a, b int) bool { return out[a].n < out[b].n })
+	return out
+}
+
+// opener is the nearest line above n, after the definition's first line,
+// indented less than n (0 if none within 300 lines).
+func opener(lines []string, n, def int) int {
+	if n < 1 || n > len(lines) {
+		return 0
+	}
+	ind := indentWidth(lines[n-1])
+	for k := n - 1; k > def && n-k <= 300; k-- {
+		t := strings.TrimSpace(lines[k-1])
+		if t == "" || strings.HasPrefix(t, "//") || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "*") || t == "}" || t == ")" || t == "]" {
+			continue
+		}
+		if indentWidth(lines[k-1]) < ind {
+			return k
+		}
+	}
+	return 0
+}
+
+func indentWidth(l string) int {
+	n := 0
+	for _, c := range l {
+		switch c {
+		case ' ':
+			n++
+		case '\t':
+			n += 4
+		default:
+			return n
+		}
+	}
+	return n
 }
 
 // bodyMax is the longest definition printed whole with -s; longer ones
@@ -464,6 +557,9 @@ func (w *writer) window(f *group.File, g *group.Group, mode int) []shownLine {
 	}
 	if mode == 0 && ctx == 0 {
 		var out []shownLine
+		if g.Sym >= 0 && g.End-g.Line > bigDef {
+			return withOpeners(f, g, splitLines(f.Data))
+		}
 		for i := range g.Hits {
 			out = append(out, shownLine{n: g.Hits[i].Line, hit: &g.Hits[i]})
 		}

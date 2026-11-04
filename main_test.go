@@ -178,7 +178,7 @@ func TestDefinitionsOnly(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d:\n%s", code, out)
 	}
-	expect(t, out, "1 definition", "shop/repo.go:11-18  func (r *Repo) Open(path string) error")
+	expect(t, out, "1 definition", "shop/repo.go:10-18  func (r *Repo) Open(path string) error")
 	out, _ = seek(t, "-d", "setSpeed")
 	expect(t, out, "web/controls.js:15-17  export function setSpeed(i)", "other hits elsewhere")
 	reject(t, out, "controls.js:1-")
@@ -207,7 +207,7 @@ func TestBodies(t *testing.T) {
 	write("shop/repo.go", goSrc)
 	out, _ := seek(t, "-s", "TrimSpace")
 	expect(t, out,
-		"  func Repo.Open  L11-18\n    11- func (r *Repo) Open(path string) error {\n",
+		"  func Repo.Open  L10-18\n    10- // Open opens a repository.\n    11- func (r *Repo) Open(path string) error {\n",
 		"    14: \t_ = strings.TrimSpace(path) // Open is fine",
 		"    18- }",
 	)
@@ -301,7 +301,7 @@ func TestFilesSeen(t *testing.T) {
 	out, _ = seek(t, "-u", "needle")
 	expect(t, out, "build/out.go", "debug.log")
 	out, _ = seek(t, "-g", "*.go", "-g", "!*_test.go", "needle")
-	expect(t, out, "src/a.go", "new.go", `in 2 *.go !*_test.go files`)
+	expect(t, out, "src/a.go", "new.go", `in 2 files matching *.go !*_test.go`)
 	reject(t, out, "a_test.go", "todo.txt")
 	out, _ = seek(t, "needle", "src")
 	expect(t, out, "in src, 2 files")
@@ -455,7 +455,7 @@ func TestFirstRoundDefinitions(t *testing.T) {
 	out, _ = seek(t, "-d", "Vendored")
 	expect(t, out, "vendor/lib/x.go:3  func Vendored()  (vendored)")
 	out, _ = seek(t, "-d", "load")
-	expect(t, out, "no definition found", "definitions containing it: load_settings (settings.py:5): seek -d --partial load")
+	expect(t, out, "no definition found", "definitions whose names contain it: load_settings (settings.py:5): seek -d --partial load")
 	out, _ = seek(t, "-d", "Nope.performTick")
 	expect(t, out, "seek -d: \"Nope.performTick\"", "seek performTick lists them")
 	out, _ = seek(t, "-d", "performTick")
@@ -487,9 +487,9 @@ func TestFirstRoundOutput(t *testing.T) {
 		t.Errorf("smoke scripts rank after source:\n%s", out)
 	}
 	out, _ = seek(t, "-s", "-b", "40", "retreat", "big.go")
-	expect(t, out, "1 of 1 file with less than their whole definitions, to stay within the budget")
+	expect(t, out, "(-s: 1 of 1 file shows only part of its definitions to fit the budget; raise -b")
 	out, _ = seek(t, "-s", "-b", "90", "retreat", "big.go")
-	expect(t, out, "      3- func f0() {\n      …\n     31- \tx()", "1 of 1 file with less than their whole definitions")
+	expect(t, out, "      3- func f0() {\n      …\n     31- \tx()", "(-s: 1 of 1 file shows only part of its definitions")
 	out, _ = seek(t, "retreat", "blob.txt")
 	expect(t, out, "not searched: blob.txt is binary")
 	out, code := seek(t, "-retreat")
@@ -539,4 +539,97 @@ func TestBodiesDontRepeatNested(t *testing.T) {
 		t.Errorf("printed %d times:\n%s", n, out)
 	}
 	expect(t, out, "  function make  L1-13\n     1- export function make(world) {\n     …\n     9- \t\t}\n    10- \t}\n    11-\n    12: \treturn { step, should };")
+}
+
+// From the second review round: hits in another case or in longer words
+// are named right under the header (also with -l, on stderr); one range per
+// definition; dots are regex dots; impls answer -d for their trait.
+func TestSecondRoundRegressions(t *testing.T) {
+	write := project(t)
+	write("u.js", "// Retreat when outnumbered.\nfunction plan(u) {\n\tif (u.retreat) {\n\t\tu.retreatVector = 1;\n\t}\n\tu.state = \"RETREATING\";\n}\n")
+	write("lib.rs", "pub trait Shape {\n    fn area(&self) -> f64;\n}\n\nmod tests {\n    struct Sq;\n    impl super::Shape for Sq {\n        fn area(&self) -> f64 {\n            1.0\n        }\n    }\n}\n")
+	write("k.go", "package k\n\nvar (\n\tDefaultLimit = 10\n\tmaxRetries   = 3\n)\n\n// Load reads it.\nfunc Load() int { return DefaultLimit }\n")
+	write("re.js", "const re = /`/g;\nfunction foo() {\n\treturn bar_word;\n}\n")
+	out, _ := seek(t, "retreat")
+	lines := strings.Split(out, "\n")
+	if len(lines) < 2 || !strings.HasPrefix(lines[1], "+3 more hits in another case or inside longer words (") || !strings.HasSuffix(lines[1], ": seek -i --partial retreat") {
+		t.Errorf("the note belongs right under the header:\n%s", out)
+	}
+	var b, e bytes.Buffer
+	w := bufio.NewWriter(&b)
+	run([]string{"-l", "retreat"}, w, &e, false)
+	w.Flush()
+	if b.String() != "u.js\n" || !strings.Contains(e.String(), "+3 more hits") {
+		t.Errorf("-l: stdout %q, stderr %q", b.String(), e.String())
+	}
+	// one range per definition, whether or not the doc comment has a hit
+	out, _ = seek(t, "DefaultLimit", "k.go")
+	expect(t, out, "  func Load  L8-9")
+	out, _ = seek(t, "-d", "Load")
+	expect(t, out, "k.go:8-9  func Load() int")
+	out, _ = seek(t, "-d", "DefaultLimit|maxRetries")
+	expect(t, out, "k.go:4  DefaultLimit = 10", "k.go:5  maxRetries   = 3")
+	out, _ = seek(t, "-c", "Default.imit", "k.go")
+	expect(t, out, "seek: \"Default.imit\" (whole word) in k.go: 2 hits")
+	out, _ = seek(t, "-d", "Shape")
+	expect(t, out, "lib.rs:1-3  pub trait Shape", "lib.rs:7-11  impl super::Shape for Sq")
+	out, _ = seek(t, "-l", "-d", "Shape|Load")
+	if out != "k.go\nlib.rs\n" {
+		t.Errorf("-l -d: %q", out)
+	}
+	out, _ = seek(t, "bar_word", "re.js")
+	expect(t, out, "  function foo  L2-4\n    3 return bar_word;\n")
+	out, _ = seek(t, "--writes", "retreatVector|DefaultLimit")
+	expect(t, out, "u.retreatVector = 1;", "DefaultLimit = 10")
+	reject(t, out, "return DefaultLimit")
+	if _, code := seek(t, "retreat", "vector"); code != 2 {
+		t.Errorf("a second word that isn't a path is an error")
+	}
+	out, _ = seek(t, "retreat", "vector")
+	expect(t, out, "join them: 'retreat|vector'")
+}
+
+// In a long definition, each hit comes after the line that opens its block.
+func TestBlockOpeners(t *testing.T) {
+	write := project(t)
+	var b strings.Builder
+	b.WriteString("func big() {\n")
+	for i := 0; i < 200; i++ {
+		b.WriteString("\tx()\n")
+	}
+	b.WriteString("\tif ready {\n\t\tneedle()\n\t}\n}\n")
+	write("b.go", "package b\n\n"+b.String())
+	out, _ := seek(t, "needle")
+	expect(t, out, "  func big  L3-207\n    204- if ready {\n    205:   needle()")
+}
+
+// Found while finishing the second round: an empty alternative crashed,
+// code in a multi-line template's ${…} was labelled a string, folders of
+// binary files gave a bare "no hits", and -d dropped -c and -C silently.
+func TestSecondRoundFollowups(t *testing.T) {
+	write := project(t)
+	write("k.go", "package k\n\nvar (\n\tLimit = 10\n)\n\nfunc f() int { return Limit }\n")
+	write("chat.js", "function render(name) {\n\treturn `\n\t\t<span>${name}</span>\n\t\t<b>name</b>\n\t`;\n}\n")
+	write("assets/a.png", "\x89PNG\x00\x00")
+	write("assets/b.png", "\x89PNG\x00\x00")
+	for _, args := range [][]string{{"Limit|"}, {"-c", "a||b"}, {"-d", "Limit|"}, {"--writes", "Limit|"}} {
+		out, code := seek(t, args...)
+		if code != 0 {
+			t.Errorf("%v: exit %d\n%s", args, code, out)
+		}
+	}
+	out, _ := seek(t, "Limit|")
+	expect(t, out, "(matches the empty string, so every line)")
+	out, _ = seek(t, "name", "chat.js")
+	expect(t, out, "<span>${name}</span>\n", "<b>name</b>  (string)")
+	out, _ = seek(t, "zzqq", "assets")
+	expect(t, out, "no hits", "not searched: 2 binary files")
+	out, _ = seek(t, "zzqq", "assets/a.png")
+	expect(t, out, "not searched: assets/a.png is binary")
+	reject(t, out, "binary files")
+	for _, args := range [][]string{{"-d", "-c", "Limit"}, {"-d", "-C", "2", "Limit"}} {
+		if out, code := seek(t, args...); code != 2 || !strings.Contains(out, "-d lists definitions one line each") {
+			t.Errorf("%v: exit %d\n%s", args, code, out)
+		}
+	}
 }
