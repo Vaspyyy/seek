@@ -1,6 +1,6 @@
 Set Shell "bash"
 Set FontFamily "JetBrainsMono Nerd Font"
-Set FontSize 17
+Set FontSize 15
 Set LineHeight 1.25
 Set Theme "Catppuccin Mocha"
 Set Padding 26

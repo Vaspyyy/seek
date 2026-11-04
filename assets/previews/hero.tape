@@ -1,6 +1,6 @@
 Output hero.gif
-Set Width 1360
-Set Height 860
+Set Width 1740
+Set Height 740
 Source common.tape
 Hide
 Type "export GIT_PAGER=cat PAGER=cat && cd skirmish && clear"
@@ -15,7 +15,7 @@ Type "clear && seek retreat"
 Sleep 300ms
 Enter
 Sleep 5s
-Type "clear && seek -s shouldRetreat src/units.js"
+Type "clear && seek -s retreatVector src/units.js"
 Sleep 300ms
 Enter
 Sleep 5s

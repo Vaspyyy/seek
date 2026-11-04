@@ -87,16 +87,16 @@ When its output isn't a terminal, seek prints plain text, so an agent can use it
   suggests similar existing names.
 ```
 
-To see whether it helps, I replayed the searches agents had made in one JavaScript project over several weeks (1,484 distinct grep calls) against the project's current code. seek's output alone was not smaller than grep's: grouping adds a line per definition, so small results grow and large ones shrink.
+To see whether it helps, I replayed the searches agents had made in one JavaScript project over several weeks (1,484 distinct grep calls) against the project's current code. seek's output alone was not smaller than grep's: grouping adds a line per definition and the header adds a line about hits in other casings or longer words, so small results grow and only the largest shrink.
 
 | Hits per search | Searches | grep output | seek output |
 | --- | ---: | ---: | ---: |
-| 1 to 5 | 411 | 21,970 tokens | 41,152 tokens |
-| 6 to 20 | 236 | 56,481 tokens | 69,850 tokens |
-| 21 to 99 | 166 | 157,373 tokens | 148,933 tokens |
-| 100 (grep stops there) | 69 | 136,576 tokens | 114,696 tokens |
+| 1 to 5 | 411 | 21,971 tokens | 44,128 tokens |
+| 6 to 20 | 236 | 56,475 tokens | 81,118 tokens |
+| 21 to 99 | 166 | 157,386 tokens | 167,717 tokens |
+| 100 (grep stops there) | 69 | 137,815 tokens | 118,505 tokens |
 
-The saving is in what comes after. In the same sessions, a search was followed by a read of the code around a hit 1,417 times, and those reads cost two and a half times as much as the searches. For the 403 searches that were followed by such reads and still match today's code, grep plus the reads came to 982,920 tokens; seek's overview alone, which names the enclosing function and its range, came to 153,313 (84% less), and `seek -s`, which prints the code itself, to 564,722 (43% less). Of the 602 old searches that find nothing in today's code, seek offers a lead for 520: a name in another case or spelling, a longer word, or a definition whose name contains the word.
+The saving is in what comes after. In the same sessions, a search was followed by a read of the code around a hit 1,417 times, and those reads cost two and a half times as much as the searches. For the 403 searches that were followed by such reads and still match today's code, grep plus the reads came to 982,920 tokens; seek's overview alone, which names the enclosing function and its range, came to 169,714 (83% less), and `seek -s`, which prints the code itself, to 568,455 (42% less). Of the 602 old searches that find nothing in today's code, seek offers a lead for 521: a name in another case or spelling, a longer word, or a definition whose name contains the word.
 
 Before release, seek went through review rounds in which several models used it on real projects to find definitions, callers and assignments, fix a planted bug and do a rename, compared it with rg, and tried to break it. What they found is covered by tests that build real files and git repositories.
 
