@@ -153,12 +153,9 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 	if o.defs {
 		// the definitions context marks first, all still shown
 		cx := bg.context()
-		moved := markedFirst(m, refs, cx)
-		if o.bodies && rank(defFiles, cx) {
-			moved = true
-		}
-		if moved {
-			cx.Use(work.Rank)
+		markedFirst(m, refs, cx)
+		if o.bodies {
+			rank(defFiles, cx)
 		}
 		roDefs.Mark = markFunc(cx)
 		fmt.Fprintf(out, "seek -d: %s: %s\n", typed, plural(len(m), "definition"))
@@ -177,15 +174,9 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 	hits := countHits(rest)
 	render.Order(rest)
 	cx := bg.context() // loaded while the search ran
-	moved := markedFirst(m, refs, cx)
-	for _, gs := range [][]*group.File{defFiles, rest} {
-		if rank(gs, cx) {
-			moved = true
-		}
-	}
-	if moved {
-		cx.Use(work.Rank)
-	}
+	markedFirst(m, refs, cx)
+	rank(defFiles, cx)
+	rank(rest, cx)
 	ms := testMentions(rest, word)
 	next := mentionNext(info, ms, word)
 	roDefs.Mark = markFunc(cx)
@@ -261,21 +252,22 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 	if len(rest) == 0 {
 		return 0
 	}
-	// the next: lines, and the context: line on top, count against the budget
-	reserve := len(next)
+	// the next: lines, and the context: line on top, come out of the hits'
+	// detail, never out of the files listed
+	extra := len(next)
 	if contextLine(cx, defFiles, rest) {
-		reserve++
+		extra++
 	}
 	hitBudget := 100
 	if o.bodies {
 		hitBudget = 300
 	}
-	hitBudget = max(hitBudget-1-reserve, 1) // the header, as in a search
+	hitBudget-- // the header, as in a search
 	if o.budgetSet {
-		hitBudget = max(budget-used-reserve, 1) // -b bounds the whole output
+		hitBudget = max(budget-used, 1) // -b bounds the whole output
 	}
 	ro := render.Options{Budget: hitBudget, Color: color, Context: o.context, Bodies: o.bodies, Counts: o.counts, Path: shown,
-		Mark: markFunc(cx), Mentions: word}
+		Mark: markFunc(cx), Mentions: word, Extra: extra}
 	hl := render.Plan(rest, ro)
 	render.Print(out, rest, hl, ro)
 	notes(out, hl, rest, ro)

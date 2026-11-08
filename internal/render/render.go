@@ -34,6 +34,11 @@ type Options struct {
 	// Mentions is the name the hits are of in ref mode: groups with a Test
 	// are labelled "(test, mentions Name)".
 	Mentions string
+	// Extra is lines the caller prints besides the files (the context:
+	// line, next: lines). They come out of the detail Budget would give
+	// (hit lines, code), never out of the files and definitions listed;
+	// with no detail to give up, they go on top of it.
+	Extra int
 }
 
 type palette struct{ bold, faint, path, sym, match, label, reset string }
@@ -191,6 +196,9 @@ func Plan(files []*group.File, o Options) *Layout {
 		top = 5
 	}
 	for lv := 2; lv <= min(top, 3); lv++ {
+		if lv == 3 {
+			room -= o.Extra // from here on it's detail: lines that show more of what's listed
+		}
 		for i := range level {
 			if files[i].Kind != "" || level[i] != lv-1 {
 				continue // lock, generated and vendored files stay on one line

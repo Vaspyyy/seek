@@ -132,10 +132,7 @@ func searchJSON(out io.Writer, args []string, o options, p *search.Pattern, gs [
 		res.Files, env.Truncated = jsonFiles(gs)
 	case o.defs:
 		defFiles, total, _ := keptDefs(o, p, gs)
-		ordered, moved := orderedDefs(defFiles, cx)
-		if moved {
-			cx.Use(work.Rank)
-		}
+		ordered := orderedDefs(defFiles, cx)
 		var defs []report.Symbol
 		for _, x := range ordered {
 			defs = append(defs, defSymbol(shown(x.f.Path), x.d, cx))
@@ -145,9 +142,7 @@ func searchJSON(out io.Writer, args []string, o options, p *search.Pattern, gs [
 		found = total > 0
 	default:
 		render.Order(gs)
-		if rank(gs, cx) {
-			cx.Use(work.Rank)
-		}
+		rank(gs, cx)
 		res.Groups, env.Truncated = jsonGroups(gs, limit(o), cx)
 		found = hits > 0
 		if o.writes {
@@ -256,9 +251,7 @@ func refJSON(out io.Writer, args []string, o options, info *repo.Info, rp refPat
 		}
 		cx = bg.context()
 		refs := ref.Refs(ts)
-		if markedFirst(m, refs, cx) {
-			cx.Use(work.Rank)
-		}
+		markedFirst(m, refs, cx)
 		var defs []report.Symbol
 		for _, i := range m {
 			if g := whole[i]; g != nil {
@@ -269,9 +262,7 @@ func refJSON(out io.Writer, args []string, o options, info *repo.Info, rp refPat
 		res.Definitions, cut = capList(defs, maxItems)
 		if !o.defs {
 			render.Order(rest)
-			if rank(rest, cx) {
-				cx.Use(work.Rank)
-			}
+			rank(rest, cx)
 			ms := testMentions(rest, word)
 			env.Links = append(env.Links, mentionLinks(ms, defRefs(refs, m))...)
 			env.Next = append(env.Next, mentionNext(info, ms, word)...)

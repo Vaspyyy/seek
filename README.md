@@ -107,7 +107,7 @@ internal/files/files_test.go  31 lines
 next: crux go test -run '^TestList$' ./internal/files/   runs the 1 test that mentions List
 ```
 
-"mentions" is all seek knows: the test names `List`, which doesn't say it tests it. The labels and `next:` lines come from the result, not from context. The `context:` line and `next:` lines count against the line budget.
+"mentions" is all seek knows: the test names `List`, which doesn't say it tests it. The labels and `next:` lines come from the result, not from context. The `context:` line and `next:` lines fit in the line budget by giving up detail (hit lines, code), never a file that would be listed; when there's no detail left to give up, they go on top of it.
 
 `--no-context` (or `PRISM_NO_CONTEXT=1`) ignores context and records nothing: the output is the same minus the marks and the `context:` line. It's for scripts and tests that compare outputs; correct results never need it. Context is [Prism's](https://github.com/Vaspyyy/prism/blob/main/docs/context.md), shared with glint, recap and crux, and costs a few milliseconds of git, run while seek searches.
 

@@ -6,12 +6,16 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/Vaspyyy/prism/focus"
 	"github.com/Vaspyyy/prism/repo"
 	"github.com/Vaspyyy/prism/report"
+	"github.com/Vaspyyy/prism/work"
+	"github.com/Vaspyyy/seek/internal/group"
+	"github.com/Vaspyyy/seek/internal/search"
 )
 
 // withContext turns context back on for a test (TestMain turns it off),
@@ -376,25 +380,105 @@ def other():
 	expect(t, out, "internal/files/more_test.go  14 lines, 3 hits in 2 places (1 test that mentions List): ")
 }
 
-// The context: line counts against the line budget: a report that fills
-// the budget without context is no longer with it.
+// listed is the files a text report lists, in order, and how many more
+// its "… N more files" line counts.
+func listed(out string) (files []string, more int) {
+	for _, l := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(l, "… "):
+			if f := strings.Fields(l); len(f) > 1 {
+				more, _ = strconv.Atoi(f[1])
+			}
+		case l == "", l[0] == ' ', strings.HasPrefix(l, "seek: "), strings.HasPrefix(l, "context: "), strings.HasPrefix(l, "next: "), strings.HasPrefix(l, "+"):
+		default:
+			files = append(files, strings.Fields(l)[0])
+		}
+	}
+	return files, more
+}
+
+// Prism's docs/output.md, rule 5: the context: line and next: lines fit in
+// the budget only by giving up detail (hit lines, code), never a file that
+// would be listed without context; with no detail to give up they go on
+// top. Ranking may move files across the cut, but as many are listed.
 func TestContextInBudget(t *testing.T) {
 	write := fixture(t)
 	for i := range 30 {
 		write(filepath.Join("pkg", "f"+itoa(i)+".go"), "package pkg\n\nfunc use"+itoa(i)+"() { List(); List() }\n")
 	}
-	write("main.go", strings.Replace(fxMain, "_ = files.List(nil)", "_ = files.List([]string{\".\"})", 1))
-	for _, b := range []int{12, 20, 40} {
-		for _, args := range [][]string{{"List"}, {"-c", "List"}, {"internal/files/files.go:List"}, {"-d", "use1"}} {
-			args = append([]string{"-b", itoa(b)}, args...)
-			on, _ := seek(t, args...)
-			off, _ := seek(t, append([]string{"--no-context"}, args...)...)
-			if !strings.HasPrefix(on, "context: ") {
-				t.Errorf("seek %v: no context: line\n%s", args, on)
-			}
-			if n, m := strings.Count(on, "\n"), strings.Count(off, "\n"); n > max(m, b) {
-				t.Errorf("seek %v: %d lines, %d without context:\n%s\nwithout:\n%s", args, n, m, on, off)
-			}
+	git(t, "add", "-A")
+	git(t, "commit", "-qm", "callers")
+	check := func(ranks bool, args ...string) {
+		t.Helper()
+		on, _ := seek(t, args...)
+		off, _ := seek(t, append([]string{"--no-context"}, args...)...)
+		if !strings.HasPrefix(on, "context: ") {
+			t.Errorf("seek %v: no context: line\n%s", args, on)
 		}
+		fOn, mOn := listed(on)
+		fOff, mOff := listed(off)
+		if len(fOn) != len(fOff) || mOn != mOff || !ranks && !slices.Equal(fOn, fOff) {
+			t.Errorf("seek %v: lists %d files +%d more, %d +%d without context:\n%s\nwithout:\n%s", args, len(fOn), mOn, len(fOff), mOff, on, off)
+		}
+		// on top only when there's no detail to give up: hit lines
+		n, m := strings.Count(on, "\n"), strings.Count(off, "\n")
+		detail := regexp.MustCompile(`(?m)^ +\d+ `).MatchString(off)
+		if n > m+1 || detail && n > m {
+			t.Errorf("seek %v: %d lines, %d without context (detail to give up: %v):\n%s\nwithout:\n%s", args, n, m, detail, on, off)
+		}
+	}
+	budgets := []int{8, 12, 20, 40, 70}
+	// the focus marks List, which comes first anyway: no ranking
+	setFocus(t, "HEAD", "internal/files/files.go:List")
+	for _, b := range budgets {
+		check(false, "-b", itoa(b), "internal/files/files.go:List")
+		check(false, "-b", itoa(b), "List")
+		check(false, "-b", itoa(b), "-s", "List")
+	}
+	// use3 moves to the front
+	setFocus(t, "HEAD", "internal/files/files.go:List", "pkg/f3.go:use3")
+	for _, b := range budgets {
+		check(true, "-b", itoa(b), "internal/files/files.go:List")
+		check(true, "-b", itoa(b), "List")
+		check(true, "-b", itoa(b), "-c", "List")
+		check(true, "-b", itoa(b), "-s", "List")
+		check(false, "-b", itoa(b), "-d", "use3")
+	}
+}
+
+// Ranking records what moved the results even when no mark gets printed:
+// the context: line names the layer, and applied has rank, not mark.
+func TestRankAlone(t *testing.T) {
+	write := fixture(t)
+	write("main.go", strings.Replace(fxMain, "_ = files.List(nil)", "_ = files.List([]string{})", 1))
+	git(t, "commit", "-qam", "run")
+	short := setFocus(t, "HEAD", "main.go:run")
+	info, err := repo.Detect(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := shown
+	shown = filepath.ToSlash
+	t.Cleanup(func() { shown = old })
+	file := func(path, name string) *group.File {
+		return &group.File{File: &search.File{Path: path}, Groups: []*group.Group{{Sym: 0, Kind: "func", Name: name}}}
+	}
+	gs := []*group.File{file("internal/files/files.go", "List"), file("main.go", "run")}
+	cx := work.Load(info, layers, false)
+	rank(gs, cx)
+	if gs[0].Path != "main.go" || !gs[0].Groups[0].Marked {
+		t.Errorf("not ranked: %s first", gs[0].Path)
+	}
+	if got, want := cx.Line(), "context: focus: commit "+short+" (recap, just now)"; got != want {
+		t.Errorf("line %q, want %q", got, want)
+	}
+	if a := cx.Applied(); !slices.Equal(a, []string{"rank"}) {
+		t.Errorf("applied %v", a)
+	}
+	// nothing moved: nothing recorded
+	cx = work.Load(info, layers, false)
+	rank(gs, cx)
+	if cx.Line() != "" || len(cx.Applied()) != 0 {
+		t.Errorf("already in order: %q %v", cx.Line(), cx.Applied())
 	}
 }

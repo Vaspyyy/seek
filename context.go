@@ -93,16 +93,6 @@ func (b *background) line() string {
 	return b.cx.Line()
 }
 
-// marked reports whether context has marks for a definition, without
-// handing them out: for ranking, which mustn't make the context: line name
-// a mark the report doesn't print.
-func marked(cx *work.State, r string) bool {
-	if cx == nil || cx.Off {
-		return false
-	}
-	return cx.Changes.Mark(r) != "" || cx.Focus.Has(r) || cx.LastRun.Failing(r)
-}
-
 // markFunc is render.Options.Mark: the marks of a printed definition.
 func markFunc(cx *work.State) func(string) string {
 	if cx == nil || cx.Off {
@@ -116,40 +106,68 @@ func groupRef(path string, g *group.Group) string {
 	return ref.Symbol(path, g.Name, g.Ordinal).String()
 }
 
+// ranked records that context reordered results, and the marks that did
+// it: the context: line names their layers even where the marks aren't
+// printed (a summary line, a definition cut by the budget).
+func ranked(cx *work.State, why []string) {
+	cx.Use(work.Rank)
+	cx.Used(why...)
+}
+
 // rank puts what context marks first: in each file the groups whose
 // definition has marks, and files with such groups before the others,
 // stable otherwise. Lock files, generated, minified and vendored code stay
-// at the end. It drops nothing, sets each group's Marked and reports
-// whether the order changed.
-func rank(gs []*group.File, cx *work.State) bool {
+// at the end. It drops nothing and sets each group's Marked. When the
+// order changed, it records that and why (ranked).
+func rank(gs []*group.File, cx *work.State) {
 	if cx == nil || cx.Off {
-		return false
+		return
 	}
-	changed := false
-	has := map[*group.File]bool{}
+	var why []string
+	fileWhy := map[*group.File][]string{}
 	for _, f := range gs {
 		path := shown(f.Path)
 		for _, g := range f.Groups {
-			g.Marked = g.Sym >= 0 && marked(cx, groupRef(path, g))
-			has[f] = has[f] || g.Marked
+			if g.Sym >= 0 {
+				ms := cx.Peek(groupRef(path, g))
+				g.Marked = len(ms) > 0
+				fileWhy[f] = append(fileWhy[f], ms...)
+			}
 		}
-		if has[f] && firstWhere(f.Groups, func(g *group.Group) bool { return g.Marked }) {
-			changed = true
+		if len(fileWhy[f]) > 0 && firstWhere(f.Groups, func(g *group.Group) bool { return g.Marked }) {
+			why = append(why, fileWhy[f]...)
 		}
 	}
-	if firstWhere(gs, func(f *group.File) bool { return has[f] && f.Kind == "" }) {
-		changed = true
+	moved := func(f *group.File) bool { return len(fileWhy[f]) > 0 && f.Kind == "" }
+	if firstWhere(gs, moved) {
+		for _, f := range gs {
+			if moved(f) {
+				why = append(why, fileWhy[f]...)
+			}
+		}
 	}
-	return changed
+	if len(why) > 0 {
+		ranked(cx, why)
+	}
 }
 
 // markedFirst puts the definitions a ref names that context marks first,
-// all still shown, and reports whether that changed their order.
-func markedFirst(m []int, refs []ref.Ref, cx *work.State) bool {
+// all still shown, and records it when that changed their order.
+func markedFirst(m []int, refs []ref.Ref, cx *work.State) {
 	if cx == nil || cx.Off {
-		return false
+		return
 	}
-	return firstWhere(m, func(i int) bool { return marked(cx, refs[i].String()) })
+	marks := map[int][]string{}
+	for _, i := range m {
+		marks[i] = cx.Peek(refs[i].String())
+	}
+	if firstWhere(m, func(i int) bool { return len(marks[i]) > 0 }) {
+		var why []string
+		for _, ms := range marks {
+			why = append(why, ms...)
+		}
+		ranked(cx, why)
+	}
 }
 
 // anyMarked reports whether a group of the files has marks (after rank).
@@ -186,8 +204,9 @@ func firstWhere[T comparable](s []T, keep func(T) bool) bool {
 }
 
 // contextLine reports whether the text report will likely get a context:
-// line, so the budget can leave room for it: context marks something in
-// the result, or says it skipped symbol detail.
+// line, so the budget can make room for it (out of detail lines, never
+// out of the files listed): context marks something in the result, or
+// says it skipped symbol detail.
 func contextLine(cx *work.State, gs ...[]*group.File) bool {
 	if cx == nil || cx.Off {
 		return false
@@ -334,8 +353,8 @@ type defAt struct {
 }
 
 // orderedDefs are the definitions -d lists, in order, the ones context
-// marks first, and whether that changed the order.
-func orderedDefs(defFiles []*group.File, cx *work.State) ([]defAt, bool) {
+// marks first (recorded when that changed the order).
+func orderedDefs(defFiles []*group.File, cx *work.State) []defAt {
 	var all []defAt
 	for _, f := range defFiles {
 		for _, d := range f.Defs {
@@ -343,22 +362,25 @@ func orderedDefs(defFiles []*group.File, cx *work.State) ([]defAt, bool) {
 		}
 	}
 	if cx == nil || cx.Off {
-		return all, false
+		return all
 	}
-	isMarked := make([]bool, len(all))
+	marks := make([][]string, len(all))
 	idx := make([]int, len(all))
+	var why []string
 	for i, x := range all {
 		idx[i] = i
 		if r := symRefOf(shown(x.f.Path), x.d); r != "" {
-			isMarked[i] = marked(cx, r)
+			marks[i] = cx.Peek(r)
+			why = append(why, marks[i]...)
 		}
 	}
-	if !firstWhere(idx, func(i int) bool { return isMarked[i] }) {
-		return all, false
+	if !firstWhere(idx, func(i int) bool { return len(marks[i]) > 0 }) {
+		return all
 	}
+	ranked(cx, why)
 	out := make([]defAt, len(all))
 	for k, i := range idx {
 		out[k] = all[i]
 	}
-	return out, true
+	return out
 }

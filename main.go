@@ -226,8 +226,8 @@ func runSearch(out *bufio.Writer, errw io.Writer, args []string, o options, tty 
 		return 1
 	}
 	cx := bg.context()
-	if !o.defs && rank(gs, cx) { // -d orders its definitions itself
-		cx.Use(work.Rank)
+	if !o.defs { // -d orders its definitions itself
+		rank(gs, cx)
 	}
 	budget := o.budget
 	if o.budgetSet && budget == 0 {
@@ -240,10 +240,10 @@ func runSearch(out *bufio.Writer, errw io.Writer, args []string, o options, tty 
 		}
 	}
 	budget-- // the header
-	if !o.defs && contextLine(cx, gs) {
-		budget-- // the context: line
-	}
 	ro := render.Options{Budget: budget, Color: color, Context: o.context, Bodies: o.bodies, Counts: o.counts, Path: shown, Mark: markFunc(cx)}
+	if !o.defs && contextLine(cx, gs) {
+		ro.Extra = 1 // the context: line, out of the detail
+	}
 	if o.defs {
 		return definitions(out, o, p, gs, scope, ro, paths, searched, cx)
 	}
@@ -810,11 +810,9 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 	more := containing(o, p, paths, have, cx)
 	if o.bodies {
 		// the definitions context marks first, all still shown
-		if rank(defFiles, cx) {
-			cx.Use(work.Rank)
-		}
+		rank(defFiles, cx)
 		if contextLine(cx, defFiles) {
-			ro.Budget-- // the context: line
+			ro.Extra = 1 // the context: line, out of the code shown
 		}
 		render.Files(out, defFiles, ro)
 		if more != "" {
@@ -822,17 +820,11 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 		}
 		return 0
 	}
-	defs, moved := orderedDefs(defFiles, cx)
-	if moved {
-		cx.Use(work.Rank)
-	}
-	room := ro.Budget
-	if len(defs) > 0 && marked(cx, symRefOf(shown(defs[0].f.Path), defs[0].d)) {
-		room-- // the context: line (marked definitions come first)
-	}
-	for printed, x := range defs {
+	// one line per definition and no detail to give up: the context: line
+	// goes on top of the budget (Prism's docs/output.md, rule 5)
+	for printed, x := range orderedDefs(defFiles, cx) {
 		f, d := x.f, x.d
-		if printed >= max(room, 1) {
+		if printed >= max(ro.Budget, 1) {
 			fmt.Fprintf(out, "… %s (raise -b)\n", plural(total-printed, "more definition"))
 			return 0
 		}
