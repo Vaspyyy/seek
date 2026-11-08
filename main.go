@@ -29,7 +29,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 const usage = `seek: search code, with hits grouped by the definition that contains them
 
