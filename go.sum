@@ -1,5 +1,5 @@
-github.com/Vaspyyy/prism v0.8.0 h1:sXMTbL2hi8hzqOEQ34JDrLhSN9TvPMdigorJvKZ2TF4=
-github.com/Vaspyyy/prism v0.8.0/go.mod h1:nZNJFGSetk95wkR7EquysOMMZtjvIBo1rVwHUr8J/vA=
+github.com/Vaspyyy/prism v0.8.1 h1:mhFvBxTIv7TZdoO4PvVqazRKxhuj4yjqMBbvMW3k3y0=
+github.com/Vaspyyy/prism v0.8.1/go.mod h1:nZNJFGSetk95wkR7EquysOMMZtjvIBo1rVwHUr8J/vA=
 golang.org/x/sys v0.49.0 h1:XbzkgYJHdqh/8m2Uu0W/dQv8nktxx4BFHp1M0gROTXA=
 golang.org/x/sys v0.49.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=
 golang.org/x/term v0.47.0 h1:cpyOwQkr2Nzxe2p6KnrTG7Ei2wtzjsuSjhpXXepZ/BM=
