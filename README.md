@@ -74,7 +74,7 @@ When everything doesn't fit the budget, files with a definition of the pattern c
 
 The labels are heuristics on the text of a line, not a parser. `(comment)` and `(string)` mark hits in comments and string literals, also in block comments and docstrings that span lines; code inside `${…}` in a template string or `{…}` in a Python f-string counts as code. Where hit lines aren't shown, the counts say what the hits were, such as `4 uses, 2 definitions, 3 assignments, 1 in a comment`, and add up to the total.
 
-Definitions come from the outline rules of [glint](https://github.com/Vaspyyy/glint), which cover Go, Rust, Python, JavaScript and TypeScript, C and C++, Java, Kotlin, C#, GDScript, shell, Lua, Ruby and Markdown headings. In other files the hits are listed without grouping.
+Definitions come from the outline rules in [Prism](https://github.com/Vaspyyy/prism) (shared with glint and recap), which cover Go, Rust, Python, JavaScript and TypeScript, C and C++, Java, Kotlin, C#, GDScript, shell, Lua, Ruby and Markdown headings. In other files the hits are listed without grouping.
 
 ## For coding agents
 
