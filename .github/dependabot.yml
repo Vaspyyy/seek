@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Daily, so a new Prism release reaches this tool quickly. Prism gets a
+  # PR of its own; other modules are grouped into one.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: daily
+    groups:
+      other-modules:
+        exclude-patterns:
+          - github.com/Vaspyyy/*
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
