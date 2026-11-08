@@ -3,7 +3,7 @@ module github.com/Vaspyyy/seek
 go 1.26.0
 
 require (
-	github.com/Vaspyyy/prism v0.2.0
+	github.com/Vaspyyy/prism v0.2.1
 	golang.org/x/term v0.47.0
 )
 
