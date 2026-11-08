@@ -7,9 +7,11 @@ import (
 	"bytes"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/Vaspyyy/prism/outline"
+	"github.com/Vaspyyy/prism/ref"
 	"github.com/Vaspyyy/seek/internal/search"
 )
 
@@ -25,13 +27,22 @@ type Group struct {
 	Sym       int // index into File.Syms, or -1
 	Kind      string
 	Name      string // qualified: Type.method
+	Ordinal   int    // N in "Name#N" when the file defines Name more than once, else 0
 	Sig       string
-	Line, End int
-	Doc       int // first line of its doc comment, when a hit is in it (else 0)
+	Line, End int // from the defining line (not the doc comment) to the last
+	Doc       int // first line of its doc comment and decorators, if it has any (else 0)
 	Hits      []Hit
 }
 
-// First is the first line to read: the doc comment's if a hit is in it.
+// RefName is the name as a ref writes it after the path: Name, or Name#N
+// when the file defines Name more than once.
+func (g *Group) RefName() string { return refName(g.Name, g.Ordinal) }
+
+func refName(name string, ordinal int) string {
+	return ref.Symbol("", name, ordinal).String()
+}
+
+// First is the first line to read: the doc comment's if it has one.
 func (g *Group) First() int {
 	if g.Doc > 0 && g.Doc < g.Line {
 		return g.Doc
@@ -46,15 +57,19 @@ type File struct {
 	Outlined bool
 	Groups   []*Group // in line order; the top-level group first if there is one
 	Defs     []Def    // definitions among the hits
+	ords     []int    // the ordinal each symbol needs in a ref (see ordinal)
 }
 
 // Def is a definition of what was searched for.
 type Def struct {
 	Kind, Name, Sig string
+	Ordinal         int // as in Group
 	Line, End       int
-	First           int  // where its doc comment starts (Line if there is none)
 	Outline         bool // found by the outline rules (not only by a keyword on its line)
 }
+
+// RefName is the name as a ref writes it after the path (see Group).
+func (d Def) RefName() string { return refName(d.Name, d.Ordinal) }
 
 // Count is the number of hits.
 func (f *File) Count() int {
@@ -78,30 +93,48 @@ func (f *File) Labelled(label string) int {
 	return n
 }
 
+// Symbols is the outline of a file as Build sees it, so a symbol's index
+// is the same in both: what the outline rules find, without definitions
+// inside docstrings and template strings. nil if the file type has no
+// outline rules.
+func Symbols(path string, data []byte) []outline.Symbol {
+	if !outline.Supported(path) || search.Kind(path, data) == "minified" {
+		return nil
+	}
+	inText, _ := multiline(path, data)
+	return realSymbols(outline.Parse(path, data, 1<<20), inText)
+}
+
+// realSymbols drops the definitions the outline found inside a docstring
+// or a template string: they aren't real.
+func realSymbols(syms []outline.Symbol, inText map[int]string) []outline.Symbol {
+	if len(inText) == 0 {
+		return syms
+	}
+	var keep []outline.Symbol
+	for _, s := range syms {
+		if inText[s.Line] == "" {
+			keep = append(keep, s)
+		}
+	}
+	if len(keep) < len(syms) {
+		return reparent(keep)
+	}
+	return syms
+}
+
 // Build groups f's hits.
 func Build(f *search.File, p *search.Pattern) *File {
 	out := &File{File: f}
+	inText, inCode := multiline(f.Path, f.Data)
 	if outline.Supported(f.Path) && f.Kind != "minified" {
-		out.Syms = outline.Parse(f.Path, f.Data, 1<<20)
+		out.Syms = realSymbols(outline.Parse(f.Path, f.Data, 1<<20), inText)
 		out.Outlined = true
 	}
 	st := styleOf(f.Path)
 	byKey := map[int]*Group{}
 	var lines []string
 	var blocks map[int]string
-	inText, inCode := multiline(f.Path, f.Data)
-	if len(inText) > 0 {
-		// definitions the outline found inside a docstring or a template aren't real
-		var keep []outline.Symbol
-		for _, s := range out.Syms {
-			if inText[s.Line] == "" {
-				keep = append(keep, s)
-			}
-		}
-		if len(keep) < len(out.Syms) {
-			out.Syms = reparent(keep)
-		}
-	}
 	for _, h := range f.Hits {
 		si := innermost(out.Syms, h.Line)
 		if l := inText[h.Line]; l != "" {
@@ -137,11 +170,11 @@ func Build(f *search.File, p *search.Pattern) *File {
 		if field != "" {
 			hit.Label = "definition"
 			out.Defs = append(out.Defs, Def{Kind: "field", Name: g.Name + "." + field,
-				Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line, First: h.Line})
+				Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line})
 		} else if si >= 0 && isDef(out.Syms[si], h, p) {
 			hit.Label = "definition"
 			s := out.Syms[si]
-			out.Defs = append(out.Defs, Def{Kind: s.Kind, Name: g.Name, Sig: s.Sig, Line: s.Line, End: s.End, First: s.Line, Outline: true})
+			out.Defs = append(out.Defs, Def{Kind: s.Kind, Name: g.Name, Ordinal: g.Ordinal, Sig: s.Sig, Line: s.Line, End: s.End, Outline: true})
 		} else {
 			hit.Label = classify(h, st)
 			// a definition by keyword, or a variable declared outside any
@@ -162,14 +195,15 @@ func Build(f *search.File, p *search.Pattern) *File {
 			a, b := widen(h.Text, h.Spans[0][0], h.Spans[0][1])
 			if k := blocks[h.Line]; k != "" && si < 0 && strings.TrimSpace(h.Text[:a]) == "" {
 				hit.Label = "definition" // a member of a var ( … ) or const ( … ) block
-				out.Defs = append(out.Defs, Def{Kind: k, Name: h.Text[a:b], Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line, First: h.Line})
+				out.Defs = append(out.Defs, Def{Kind: k, Name: h.Text[a:b], Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line})
 			} else if hit.Label == "definition" || si < 0 && topLevelDecl(h, hit.Label, st) {
-				out.Defs = append(out.Defs, Def{Kind: declKind(h), Name: h.Text[a:b], Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line, First: h.Line})
+				out.Defs = append(out.Defs, Def{Kind: declKind(h), Name: h.Text[a:b], Sig: clip(strings.TrimSpace(h.Text), 110), Line: h.Line, End: h.Line})
 			}
 		}
 		g.Hits = append(g.Hits, hit)
 	}
-	// a definition's range starts at its doc comment, the same in every view
+	// -s shows a definition's doc comment too (its range starts at the
+	// defining line, as compilers and editors report it)
 	if len(out.Groups) > 0 && out.Outlined {
 		if lines == nil {
 			lines = strings.Split(string(f.Data), "\n")
@@ -179,11 +213,6 @@ func Build(f *search.File, p *search.Pattern) *File {
 				if d := docStart(lines, g.Line, st, inText); d < g.Line {
 					g.Doc = d
 				}
-			}
-		}
-		for i := range out.Defs {
-			if d := &out.Defs[i]; d.Outline {
-				d.First = docStart(lines, d.Line, st, inText)
 			}
 		}
 	}
@@ -196,6 +225,37 @@ func Build(f *search.File, p *search.Pattern) *File {
 		}
 	}
 	return out
+}
+
+// Whole is a group for the definition Syms[i] with every hit inside it:
+// in its doc comment, its own lines and the definitions nested in it. It
+// is for showing the definition itself, as a ref names it.
+func (f *File) Whole(i int) *Group {
+	s := f.Syms[i]
+	g := &Group{Sym: i, Kind: s.Kind, Name: outline.Qualified(f.Syms, i), Ordinal: f.ordinal(i), Sig: s.Sig, Line: s.Line, End: s.End}
+	inText, _ := multiline(f.Path, f.Data)
+	if d := docStart(strings.Split(string(f.Data), "\n"), s.Line, styleOf(f.Path), inText); d < s.Line {
+		g.Doc = d
+	}
+	for _, o := range f.Groups {
+		for _, h := range o.Hits {
+			if h.Line >= g.First() && h.Line <= max(g.End, g.Line) {
+				g.Hits = append(g.Hits, h)
+			}
+		}
+	}
+	slices.SortFunc(g.Hits, func(a, b Hit) int { return a.Line - b.Line })
+	return g
+}
+
+// ordinal is the N a ref to Syms[i] needs ("parse#2"), or 0 when its name
+// is unique in the file. It counts over the whole outline, not just the
+// definitions shown, so it doesn't depend on what was searched for.
+func (f *File) ordinal(i int) int {
+	if f.ords == nil {
+		f.ords = ref.Ordinals(ref.Targets(f.Path, f.Syms))
+	}
+	return f.ords[i]
 }
 
 // docOf is the definition that the comment on line n documents: the next
@@ -278,6 +338,7 @@ func groupFor(out *File, byKey map[int]*Group, si int) *Group {
 		if si >= 0 {
 			s := out.Syms[si]
 			g.Kind, g.Name, g.Sig, g.Line, g.End = s.Kind, outline.Qualified(out.Syms, si), s.Sig, s.Line, s.End
+			g.Ordinal = out.ordinal(si)
 		}
 		byKey[si] = g
 		out.Groups = append(out.Groups, g)

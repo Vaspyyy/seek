@@ -32,17 +32,20 @@ seek PATTERN [PATH...]
 
 A pattern is a regular expression in Go's syntax. One that is an identifier, or several joined by `|` (`setSpeed`, `Repo.Open`, `load|save`), matches whole words only and is case-sensitive, so `seek speed` doesn't find `speedMult` or `Speed`. When other casings or longer words match too, the line right under the header says how many and which, with the command that includes them (`-i --partial`). A dot stays a regex dot, so `lim.t` finds `limit`. A pattern that matches the empty string, such as `a|`, matches every line, and the header says so. A pattern that isn't a valid regex, such as `foo(`, is searched as plain text, and the header says so.
 
+A pattern that is a [ref](#refs) to a file shows what the ref names: `seek internal/files/files.go:List` prints the definition of `List` as `-s` would, doc comment included, then the hits of `List` elsewhere in the repository, grouped by the definitions that contain them (its callers and mentions). The path can be relative to the repository root or to the working directory, or just its end (`files.go:List`), and the name can be the end of a qualified one (`files.go:match` for `globSet.match`). A line (`main.go:104`, as compilers print it) stands for the innermost definition containing it. A name that fits several definitions shows all of them; one that fits none lists the file's definitions it might mean. Without `-b`, the definition gets the room `-s` has and the hits the usual 100 lines; `-b N` bounds both together. A pattern whose path isn't a file is a regex as usual, so `seek 'todo:fix'` still searches text, and `-F` or `-e` always read the pattern as a pattern. A ref to a commit (`main.go:run@b681ef1`) is for recap: seek searches the working tree.
+
 | Command | Shows |
 | --- | --- |
 | `seek X` | every hit, grouped by the definition that contains it |
-| `seek -d X` | only where X is defined, one line each (also `Type.method`, fields, module-level constants and, for a trait, its `impl` blocks) |
+| `seek FILE:NAME` | that definition, then its callers and mentions (`FILE:LINE`: the definition containing that line) |
+| `seek -d X` | only where X is defined, one line each with its ref, lines and signature (also `Type.method`, fields, module-level constants and, for a trait, its `impl` blocks) |
 | `seek -s X` | the containing definitions in full, or the lines around the hits in long ones |
 | `seek -c X` | one line per definition with its hit count and line numbers |
 | `seek -l X` | only the paths of files with hits (`-0` separates them with NUL bytes; with `-d`, the files that define X) |
 | `seek --writes X` | only the hits that set X: definitions, declarations and assignments (not getters or destructuring keys) |
 | `seek -C 3 X` | three lines of context around each hit |
 
-`-i` ignores case, `-F` takes the pattern as plain text, `-w` makes a regex match whole words, `-g GLOB` limits the search to matching files (`-g '*.ts' -g '!*.test.ts'`), and `-b N` sets roughly how many lines the output may use (100 by default, 300 with `-s`, 0 for no limit). The files searched are what git sees in a repository, tracked and untracked but not ignored; outside a repository, caches, build output and dot-folders are skipped, and `-u` includes all of them. A path you name is searched even when git ignores it, and when nothing matches, seek says which folders and binary files it skipped. A qualified name that never appears as text, such as `Repo.Changes` for `func (r *Repo) Changes`, is pointed to its definition. `-A` gives plain output without colors, which is the default when stdout isn't a terminal. The exit status is 0 if something matched, 1 if not and 2 on errors, as with grep.
+`-i` ignores case, `-F` takes the pattern as plain text, `-w` makes a regex match whole words, `-g GLOB` limits the search to matching files (`-g '*.ts' -g '!*.test.ts'`), and `-b N` sets roughly how many lines the output may use (100 by default, 300 with `-s`, 0 for no limit). The files searched are what git sees in a repository, tracked and untracked but not ignored; outside a repository, caches, build output and dot-folders are skipped, and `-u` includes all of them. Paths are printed relative to the repository root, also when seek runs in a subdirectory (outside a repository, relative to the working directory); `-l` prints them relative to the working directory, for the command it's piped to. A path you name is searched even when git ignores it, and when nothing matches, seek says which folders and binary files it skipped. A qualified name that never appears as text, such as `Repo.Changes` for `func (r *Repo) Changes`, is pointed to its definition. `-A` gives plain output without colors, which is the default when stdout isn't a terminal. The exit status is 0 if something matched, 1 if not and 2 on errors, as with grep.
 
 ## What it prints
 
@@ -56,7 +59,7 @@ src/ui.js  10 lines
   function bindUi  L1-10
      8 sim.setSpeed(Number(e.target.value)); // the retreat speed is fixed  (comment)
 src/units.js  33 lines
-  function createUnitUpdater.shouldRetreat  L4-12
+  function createUnitUpdater.shouldRetreat  L8-12
      6 * The retreat vector points away from the nearest enemies.  (comment)
   function createUnitUpdater.step  L19-30
     21 unit.state = "retreat";  (string)
@@ -68,13 +71,24 @@ README.md  4 lines
     4 they are outnumbered, then retreat away from the nearest enemies.
 ```
 
-Each file gets a line with its path and size. Below it come the definitions with hits, named the way they nest (`Type.method`, `outer.inner`, `worker.onmessage` for a callback assigned to a property), with their line range, and then the hit lines with the nesting they have in the file. A doc comment belongs to the definition below it, and the range always starts at the comment, so a definition has the same range in every view. Hits outside any definition are listed as `(top level)`. In a definition longer than 150 lines, each hit comes after the line that opens its block, such as the `if` or loop around it, so a 1500-line factory function still says where in it a hit is.
+Each file gets a line with its path and size. Below it come the definitions with hits, named the way they nest (`Type.method`, `outer.inner`, `worker.onmessage` for a callback assigned to a property), with their line range, and then the hit lines with the nesting they have in the file. The file's path, a colon and a definition's name make its [ref](#refs) (`src/units.js:createUnitUpdater.step`); a name defined more than once in a file is shown as `parse#1`, `parse#2`. A doc comment belongs to the definition below it, so a hit in it is listed there, but the range starts at the definition's own line, as compilers and editors report it (`-s` prints the comment too), so a definition has the same range in every view and in every tool. Hits outside any definition are listed as `(top level)`. In a definition longer than 150 lines, each hit comes after the line that opens its block, such as the `if` or loop around it, so a 1500-line factory function still says where in it a hit is.
 
 When everything doesn't fit the budget, files with a definition of the pattern come first, then source, tests, documentation and data, and last lock files, generated, minified and vendored code. Each file gets a line first; then, in that order, a line per definition with its hit count and line numbers; then the hit lines. With `-s`, files get their definitions whole in order, or the lines around their hits; with `-C`, files get as much context as fits, down to none, but always their hit lines. A closing line says how many files got less than asked for.
 
 The labels are heuristics on the text of a line, not a parser. `(comment)` and `(string)` mark hits in comments and string literals, also in block comments and docstrings that span lines; code inside `${…}` in a template string or `{…}` in a Python f-string counts as code. Where hit lines aren't shown, the counts say what the hits were, such as `4 uses, 2 definitions, 3 assignments, 1 in a comment`, and add up to the total.
 
 Definitions come from the outline rules in [Prism](https://github.com/Vaspyyy/prism) (shared with glint and recap), which cover Go, Rust, Python, JavaScript and TypeScript, C and C++, Java, Kotlin, C#, GDScript, shell, Lua, Ruby and Markdown headings. In other files the hits are listed without grouping.
+
+## Refs
+
+glint, seek, recap and crux name files, symbols and locations the same way, so anything one of them prints can be handed to another as is:
+
+- `internal/files/files.go`: a file
+- `internal/files/files.go:List`: a symbol, by its qualified name (`Repo.Open` for a method, `outer.inner` for a nested function)
+- `internal/files/files.go:73`: a line (`73:5` with a column, `73-107` a range); tools that take a symbol use the innermost one containing it
+- `main.go:run@b681ef1`: a symbol as it was in a commit; `lib.cpp:parse#2`: the second of two definitions with the same name
+
+Paths are relative to the repository root. The format is specified in [Prism](https://github.com/Vaspyyy/prism/blob/main/docs/refs.md).
 
 ## For coding agents
 

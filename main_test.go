@@ -127,7 +127,7 @@ func TestGroupsAndLabels(t *testing.T) {
 	expect(t, out,
 		`seek: "Open" (whole word): 5 hits in 1 file`+"\n",
 		"shop/repo.go  23 lines\n",
-		"  func Repo.Open  L10-18\n    10 // Open opens a repository.  (comment)\n    11 func",
+		"  func Repo.Open  L11-18\n    10 // Open opens a repository.  (comment)\n    11 func",
 		"    11 func (r *Repo) Open(path string) error {\n",
 		"    14   _ = strings.TrimSpace(path) // Open is fine  (comment)",
 		`    15   msg := "Open failed"  (string)`,
@@ -179,9 +179,9 @@ func TestDefinitionsOnly(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d:\n%s", code, out)
 	}
-	expect(t, out, "1 definition", "shop/repo.go:10-18  func (r *Repo) Open(path string) error")
+	expect(t, out, "1 definition", "shop/repo.go:Repo.Open  L11-18  func (r *Repo) Open(path string) error")
 	out, _ = seek(t, "-d", "setSpeed")
-	expect(t, out, "web/controls.js:15-17  export function setSpeed(i)", "other hits elsewhere")
+	expect(t, out, "web/controls.js:setSpeed  L15-17  export function setSpeed(i)", "other hits elsewhere")
 	reject(t, out, "controls.js:1-")
 	write("web/conf.js", "export const LIMIT = 5;\nfunction f() {\n\tconst LIMIT = 2;\n\treturn LIMIT;\n}\n")
 	out, _ = seek(t, "-d", "LIMIT")
@@ -208,7 +208,7 @@ func TestBodies(t *testing.T) {
 	write("shop/repo.go", goSrc)
 	out, _ := seek(t, "-s", "TrimSpace")
 	expect(t, out,
-		"  func Repo.Open  L10-18\n    10- // Open opens a repository.\n    11- func (r *Repo) Open(path string) error {\n",
+		"  func Repo.Open  L11-18\n    10- // Open opens a repository.\n    11- func (r *Repo) Open(path string) error {\n",
 		"    14: \t_ = strings.TrimSpace(path) // Open is fine",
 		"    18- }",
 	)
@@ -344,7 +344,7 @@ func TestMultilineStrings(t *testing.T) {
 	write("m.py", "\"\"\"Module.\n\ndef fake():  # an example\n\"\"\"\n\n\ndef real():\n    s = '''\n    fake text\n    '''\n    return s\n")
 	write("t.ts", "const page = `\n  function fake() {}\n`;\nexport function realTs() { return page; }\n")
 	out, _ := seek(t, "-d", "fake|real|realTs")
-	expect(t, out, "m.py:7-11  def real():", "t.ts:4  export function realTs()")
+	expect(t, out, "m.py:real  L7-11  def real():", "t.ts:realTs  L4  export function realTs()")
 	reject(t, out, "m.py:3", "t.ts:2")
 	out, _ = seek(t, "fake")
 	expect(t, out, "3 def fake():  # an example  (string)", "9 fake text  (string)", "2 function fake() {}  (string)")
@@ -362,12 +362,13 @@ func TestOneLineFiles(t *testing.T) {
 		"app.min.js  1 line, minified, 1 hit (1 declaration): L1 var needle=1;aaaa", "go.sum  3 lines, lock file, 3 hits: L1, 2, 3")
 }
 
-// -s starts a definition at its doc comment when the hit is there.
+// -s starts a definition at its doc comment when the hit is there; its
+// range starts at the defining line.
 func TestBodyIncludesDocCommentHit(t *testing.T) {
 	write := project(t)
 	write("a.rs", "/// The label is yellow.\nfn label() -> u32 {\n    1\n}\n")
 	out, _ := seek(t, "-s", "yellow")
-	expect(t, out, "  fn label  L1-4\n    1: /// The label is yellow.  (comment)\n    2- fn label() -> u32 {")
+	expect(t, out, "  fn label  L2-4\n    1: /// The label is yellow.  (comment)\n    2- fn label() -> u32 {")
 }
 
 // A pattern of thousands of names finishes quickly, and the header doesn't
@@ -407,7 +408,7 @@ func TestFirstRoundPatterns(t *testing.T) {
 	out, _ = seek(t, "ber_limit")
 	expect(t, out, "no hits", "über_limit  1 hit, defined at über.py:1 (def)")
 	out, _ = seek(t, "-d", "über_limit")
-	expect(t, out, "über.py:1-2  def über_limit():")
+	expect(t, out, "über.py:über_limit  L1-2  def über_limit():")
 	if _, code := seek(t, "-g", "[", "limit"); code != 2 {
 		t.Errorf("an unclosed [ in a glob is an error")
 	}
@@ -426,7 +427,7 @@ func TestFirstRoundLabels(t *testing.T) {
 	write("r.rs", "fn f() {\n    let q = '\"'; let v = target;\n}\n")
 	out, _ := seek(t, "getCode")
 	expect(t, out, "1 const url = `https://x/${getCode(c)}.webp`;\n", "2 const msg = `getCode is ${n}`;  (string)",
-		"3 const u = \"getCode\"; getCode();\n", "  function getCode  L4-7\n    5  getCode was renamed  (comment)")
+		"3 const u = \"getCode\"; getCode();\n", "  function getCode  L7\n    5  getCode was renamed  (comment)")
 	out, _ = seek(t, "limit", "m.py")
 	expect(t, out, "5 return f\"{self.limit} items\"\n")
 	out, _ = seek(t, "target", "r.rs")
@@ -443,24 +444,24 @@ func TestFirstRoundDefinitions(t *testing.T) {
 	write("vendor/lib/x.go", "package lib\n\nfunc Vendored() {}\n")
 	write("main.js", "const { performTick } = createTick();\nexport function createTick() {\n\tfunction performTick() {}\n\treturn { performTick };\n}\n")
 	out, _ := seek(t, "-d", "Sampler|sampler|compileSampler")
-	expect(t, out, "V.java:2  private final Sampler sampler;", "V.java:3-5  public Sampler compileSampler(int x)")
+	expect(t, out, "V.java:2  private final Sampler sampler;", "V.java:Oracle.compileSampler  L3-5  public Sampler compileSampler(int x)")
 	reject(t, out, "3 definitions") // the types in the field and the method aren't definitions of Sampler
 	out, _ = seek(t, "-d", "fmt")
-	expect(t, out, "1 definition", "e.rs:2-4  fn fmt(")
+	expect(t, out, "1 definition", "e.rs:DecodeError.fmt  L2-4  fn fmt(")
 	out, _ = seek(t, "-d", "impl.*Display for")
-	expect(t, out, "e.rs:1-5  impl fmt::Display for DecodeError")
+	expect(t, out, "e.rs:fmt::Display for DecodeError  L1-5  impl fmt::Display for DecodeError")
 	out, _ = seek(t, "-d", "limitOf")
 	expect(t, out, "no definition found")
 	out, _ = seek(t, "-d", "--partial", "recent")
 	expect(t, out, "settings.py:2  recent_projects: list = []")
 	out, _ = seek(t, "-d", "Vendored")
-	expect(t, out, "vendor/lib/x.go:3  func Vendored()  (vendored)")
+	expect(t, out, "vendor/lib/x.go:Vendored  L3  func Vendored()  (vendored)")
 	out, _ = seek(t, "-d", "load")
-	expect(t, out, "no definition found", "definitions whose names contain it: load_settings (settings.py:5): seek -d --partial load")
+	expect(t, out, "no definition found", "definitions whose names contain it: settings.py:load_settings: seek -d --partial load")
 	out, _ = seek(t, "-d", "Nope.performTick")
 	expect(t, out, "seek -d: \"Nope.performTick\"", "seek performTick lists them")
 	out, _ = seek(t, "-d", "performTick")
-	expect(t, out, "main.js:3  function performTick()")
+	expect(t, out, "main.js:createTick.performTick  L3  function performTick()")
 	reject(t, out, "main.js:1") // destructuring binds, it doesn't define
 }
 
@@ -563,17 +564,17 @@ func TestSecondRoundRegressions(t *testing.T) {
 	if b.String() != "u.js\n" || !strings.Contains(e.String(), "+3 more hits") {
 		t.Errorf("-l: stdout %q, stderr %q", b.String(), e.String())
 	}
-	// one range per definition, whether or not the doc comment has a hit
+	// one range per definition, from its defining line, whether or not the doc comment has a hit
 	out, _ = seek(t, "DefaultLimit", "k.go")
-	expect(t, out, "  func Load  L8-9")
+	expect(t, out, "  func Load  L9\n")
 	out, _ = seek(t, "-d", "Load")
-	expect(t, out, "k.go:8-9  func Load() int")
+	expect(t, out, "k.go:Load  L9  func Load() int")
 	out, _ = seek(t, "-d", "DefaultLimit|maxRetries")
 	expect(t, out, "k.go:4  DefaultLimit = 10", "k.go:5  maxRetries   = 3")
 	out, _ = seek(t, "-c", "Default.imit", "k.go")
 	expect(t, out, "seek: \"Default.imit\" (whole word) in k.go: 2 hits")
 	out, _ = seek(t, "-d", "Shape")
-	expect(t, out, "lib.rs:1-3  pub trait Shape", "lib.rs:7-11  impl super::Shape for Sq")
+	expect(t, out, "lib.rs:Shape  L1-3  pub trait Shape", "lib.rs:tests.super::Shape for Sq  L7-11  impl super::Shape for Sq")
 	out, _ = seek(t, "-l", "-d", "Shape|Load")
 	if out != "k.go\nlib.rs\n" {
 		t.Errorf("-l -d: %q", out)
@@ -714,4 +715,281 @@ func TestFinalRoundOpus(t *testing.T) {
 	expect(t, out, "no definition found")
 	out, _ = seek(t, "target", "w.js")
 	expect(t, out, "more ${target + 1} text target\n")
+}
+
+const filesSrc = `package files
+
+import "strings"
+
+// List returns the names.
+// It is sorted.
+func List(roots []string) []string {
+	return roots
+}
+
+type globSet struct{}
+
+func (g globSet) match(p string) bool {
+	return strings.HasPrefix(p, "x")
+}
+`
+
+const mainSrc = `package main
+
+import "x/internal/files"
+
+func run() {
+	_ = files.List(nil)
+	// List is called above
+}
+
+func main() {
+	run()
+}
+`
+
+const cppSrc = `int parse(const char* s) {
+    return 1;
+}
+
+int parse(int n) {
+    return parse("x") + n;
+}
+
+void use() {
+    parse(2);
+}
+`
+
+// refProject writes a small repository for the ref tests.
+func refProject(t *testing.T) func(name, text string) {
+	t.Helper()
+	write := project(t)
+	write("internal/files/files.go", filesSrc)
+	write("main.go", mainSrc)
+	write("src/lib.cpp", cppSrc)
+	write("notes.txt", "todo:run later\nsee internal/files/files.go:List\n")
+	gitInit(t)
+	return write
+}
+
+// A definition's range starts at its defining line, as compilers and
+// editors report it; -s still shows the doc comment above it.
+func TestRangesFromDefiningLine(t *testing.T) {
+	refProject(t)
+	out, _ := seek(t, "List", "internal")
+	expect(t, out, "  func List  L7-9\n    5 // List returns the names.  (comment)\n    7 func List(roots []string) []string {\n")
+	out, _ = seek(t, "-d", "List")
+	expect(t, out, "internal/files/files.go:List  L7-9  func List(roots []string) []string\n")
+	reject(t, out, "L5-9", ":5-9")
+	out, _ = seek(t, "-s", "roots", "internal")
+	expect(t, out, "  func List  L7-9\n    5- // List returns the names.\n    6- // It is sorted.\n    7: func List(roots []string) []string {")
+}
+
+// A name defined twice in a file gets "#N" wherever it's printed, counted
+// over the whole file, so that the file and the name make a ref.
+func TestOrdinalsInOutput(t *testing.T) {
+	refProject(t)
+	out, _ := seek(t, "parse")
+	expect(t, out, "  func parse#1  L1-3\n", "  func parse#2  L5-7\n", "  func use  L9-11\n")
+	out, _ = seek(t, "-d", "parse")
+	expect(t, out, "src/lib.cpp:parse#1  L1-3  int parse(const char* s)\n", "src/lib.cpp:parse#2  L5-7  int parse(int n)\n")
+	// only the second one has a hit of "n": still #2
+	out, _ = seek(t, "-c", "n", "src")
+	expect(t, out, "  func parse#2  L5-7  2 hits")
+	out, _ = seek(t, "-b", "3", "parse")
+	expect(t, out, "in 3 places: parse#2 2, parse#1 1, use 1")
+}
+
+// Paths are printed from the repository root, also in a subdirectory;
+// -l prints them from the working directory, for the commands it feeds.
+func TestPathsFromRepositoryRoot(t *testing.T) {
+	refProject(t)
+	if err := os.Chdir("internal"); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := seek(t, "List")
+	expect(t, out, "internal/files/files.go  15 lines\n")
+	reject(t, out, "\nfiles/files.go")
+	out, _ = seek(t, "-d", "List")
+	expect(t, out, "internal/files/files.go:List  L7-9")
+	out, _ = seek(t, "List", "files/files.go")
+	expect(t, out, `"List" (whole word) in internal/files/files.go: 2 hits`)
+	out, _ = seek(t, "-l", "List")
+	if out != "files/files.go\n" {
+		t.Errorf("-l: %q", out)
+	}
+	// outside a repository: from the working directory
+	write := project(t)
+	write("pkg/a.go", "package a\n\nfunc needle() {}\n")
+	if err := os.Chdir("pkg"); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = seek(t, "-d", "needle")
+	expect(t, out, "\na.go:needle  L3  func needle()")
+}
+
+// A ref as the pattern shows the definition, then the hits of its name
+// elsewhere, grouped by the definitions that contain them.
+func TestRefPattern(t *testing.T) {
+	refProject(t)
+	out, code := seek(t, "internal/files/files.go:List")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	expect(t, out,
+		`seek: internal/files/files.go:List (func, L7-9), then 3 hits of "List" in 2 files`+"\n",
+		"internal/files/files.go  15 lines\n  func List  L7-9\n    5: // List returns the names.  (comment)\n    6- // It is sorted.\n    7: func List(roots []string) []string {\n    8- \treturn roots\n    9- }\n",
+		"main.go  12 lines\n  func run  L5-8\n    6 _ = files.List(nil)\n    7 // List is called above  (comment)\n",
+		"notes.txt  2 lines\n  2 see internal/files/files.go:List\n",
+	)
+	if n := strings.Count(out, "func List(roots"); n != 1 {
+		t.Errorf("the definition is shown %d times:\n%s", n, out)
+	}
+	// the end of a path, a name's last part, a method
+	for _, r := range []string{"files.go:globSet.match", "files.go:match", "internal/files/files.go:globSet.match"} {
+		out, _ = seek(t, r)
+		expect(t, out, `seek: internal/files/files.go:globSet.match (func, L13-15), no other hits of "match"`, "  func globSet.match  L13-15\n    13: func (g globSet) match(p string) bool {")
+	}
+	// -d prints just the definition, as a ref
+	out, _ = seek(t, "-d", "files.go:List")
+	expect(t, out, "internal/files/files.go:List  L7-9  func List(roots []string) []string\n")
+	reject(t, out, "main.go")
+	// -l lists the files with hits; -c counts the hits elsewhere
+	out, _ = seek(t, "-l", "files.go:List")
+	if out != "internal/files/files.go\nmain.go\nnotes.txt\n" {
+		t.Errorf("-l: %q", out)
+	}
+	out, _ = seek(t, "-c", "files.go:List")
+	expect(t, out, "  func run  L5-8  2 hits (1 use, 1 in a comment): L6, 7")
+}
+
+func TestRefPatternOrdinals(t *testing.T) {
+	refProject(t)
+	out, _ := seek(t, "lib.cpp:parse#2")
+	expect(t, out, `seek: src/lib.cpp:parse#2 (func, L5-7), then 2 hits of "parse" in 1 file`,
+		"  func parse#2  L5-7\n    5: int parse(int n) {\n    6:     return parse(\"x\") + n;\n    7- }\n",
+		"  func parse#1  L1-3\n     1 int parse(const char* s) {\n", "  func use  L9-11\n    10 parse(2);")
+	// without the ordinal: both, then the hits once
+	out, code := seek(t, "src/lib.cpp:parse")
+	if code != 0 {
+		t.Errorf("exit %d", code)
+	}
+	expect(t, out, `seek: src/lib.cpp:parse matches 2 definitions: src/lib.cpp:parse#1 (func, L1-3), src/lib.cpp:parse#2 (func, L5-7); then 1 hit of "parse" in 1 file`,
+		"  func parse#1  L1-3\n    1: int parse(const char* s) {\n", "  func parse#2  L5-7\n    5: int parse(int n) {\n", "  func use  L9-11\n    10 parse(2);")
+	if n := strings.Count(out, "parse(2);"); n != 1 {
+		t.Errorf("the hits are shown %d times:\n%s", n, out)
+	}
+}
+
+func TestRefPatternNoMatch(t *testing.T) {
+	refProject(t)
+	out, code := seek(t, "files.go:Lis")
+	if code != 1 {
+		t.Errorf("exit %d", code)
+	}
+	expect(t, out, `seek: files.go:Lis: no definition named "Lis" in internal/files/files.go`, `names that contain "Lis": internal/files/files.go:List`+"\n",
+		"to search for it as text: seek -F 'files.go:Lis'")
+	out, _ = seek(t, "files.go:zzz")
+	expect(t, out, "definitions there: internal/files/files.go:List, internal/files/files.go:globSet, internal/files/files.go:globSet.match\n")
+	out, code = seek(t, "lib.cpp:parse#3")
+	if code != 1 || !strings.Contains(out, "src/lib.cpp:parse#1, src/lib.cpp:parse#2") {
+		t.Errorf("exit %d:\n%s", code, out)
+	}
+}
+
+// A line stands for the innermost definition containing it.
+func TestRefPatternLocation(t *testing.T) {
+	refProject(t)
+	for _, r := range []string{"main.go:6", "main.go:6:7", "main.go:6-11"} {
+		out, code := seek(t, r)
+		if code != 0 {
+			t.Errorf("%s: exit %d", r, code)
+		}
+		expect(t, out, "seek: "+r+` is in main.go:run (func, L5-8), then 2 hits of "run" in 2 files`,
+			"  func run  L5-8\n    5: func run() {\n", "  func main  L10-12\n    11 run()")
+	}
+	out, code := seek(t, "main.go:3")
+	if code != 1 {
+		t.Errorf("outside: exit %d", code)
+	}
+	expect(t, out, "seek: main.go:3 is outside any definition, so there's no name to search for\nmain.go  12 lines\n  1- package main\n  2-\n  3: import \"x/internal/files\"\n  4-\n  5- func run() {\n")
+	out, code = seek(t, "main.go:99")
+	if code != 1 || !strings.Contains(out, "main.go:99: main.go has 12 lines") {
+		t.Errorf("past the end: exit %d:\n%s", code, out)
+	}
+}
+
+// seek searches the working tree: a ref to a commit points to recap.
+func TestRefPatternRevision(t *testing.T) {
+	refProject(t)
+	cmd := exec.Command("git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "commit", "-qm", "init")
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %s", out)
+	}
+	out, code := seek(t, "main.go:run@HEAD")
+	if code != 2 {
+		t.Errorf("exit %d", code)
+	}
+	expect(t, out, "seek searches the working tree; for that version use: recap show HEAD --show 'main.go:run'")
+	// an @ that isn't a revision is part of the name
+	out, code = seek(t, "main.go:run@nothing")
+	if code != 1 || !strings.Contains(out, `no definition named "run@nothing"`) {
+		t.Errorf("exit %d:\n%s", code, out)
+	}
+}
+
+// A pattern whose path isn't a file stays a regex; -F and -e always mean a
+// pattern.
+func TestRefPatternOrRegex(t *testing.T) {
+	refProject(t)
+	out, code := seek(t, "todo:run")
+	if code != 0 {
+		t.Errorf("exit %d", code)
+	}
+	expect(t, out, `seek: "todo:run": 1 hit in 1 file`, "1 todo:run later")
+	out, code = seek(t, "nofile.go:List")
+	if code != 1 || !strings.Contains(out, `"nofile.go:List"`) || !strings.Contains(out, "no hits") {
+		t.Errorf("exit %d:\n%s", code, out)
+	}
+	for _, args := range [][]string{{"-F", "internal/files/files.go:List"}, {"-e", "internal/files/files.go:List"}} {
+		out, _ = seek(t, args...)
+		expect(t, out, `"internal/files/files.go:List"`, "1 hit in 1 file", "2 see internal/files/files.go:List")
+		reject(t, out, "func List")
+	}
+}
+
+// From a subdirectory, a ref's path may be relative to it, the hits come
+// from the whole repository, and the repository root wins when both
+// readings exist.
+func TestRefPatternFromSubdirectory(t *testing.T) {
+	write := refProject(t)
+	write("internal/files/main.go", "package files\n\nfunc other() {}\n")
+	if err := os.Chdir("internal/files"); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := seek(t, "files.go:List")
+	expect(t, out, `seek: internal/files/files.go:List (func, L7-9), then 3 hits of "List" in 2 files`, "main.go  12 lines\n  func run  L5-8\n")
+	out, _ = seek(t, "main.go:run")
+	expect(t, out, "seek: main.go:run (func, L5-8)", "(main.go is read from the repository root, not as internal/files/main.go)")
+}
+
+// The end of a path that fits several files: a name is looked for in all
+// of them, a line names none.
+func TestRefPatternAmbiguousPath(t *testing.T) {
+	write := refProject(t)
+	write("a/util.go", "package a\n\nfunc helper() {}\n")
+	write("b/util.go", "package b\n\nfunc helper() {}\n\nfunc other() { helper() }\n")
+	out, code := seek(t, "util.go:helper")
+	if code != 0 {
+		t.Errorf("exit %d", code)
+	}
+	expect(t, out, `seek: util.go:helper matches 2 definitions: a/util.go:helper (func, L3), b/util.go:helper (func, L3); then 1 hit of "helper" in 1 file`,
+		"a/util.go  3 lines\n  func helper  L3\n", "b/util.go  5 lines\n  func helper  L3\n", "  func other  L5\n    5 func other() { helper() }")
+	out, code = seek(t, "util.go:3")
+	if code != 1 {
+		t.Errorf("exit %d", code)
+	}
+	expect(t, out, "seek: util.go:3: 2 paths end in util.go; name one: a/util.go:3, b/util.go:3\n")
 }
