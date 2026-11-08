@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/Vaspyyy/glint/outline"
+	"github.com/Vaspyyy/prism/outline"
 	"github.com/Vaspyyy/seek/internal/search"
 )
 
