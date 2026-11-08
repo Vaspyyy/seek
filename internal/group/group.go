@@ -32,6 +32,13 @@ type Group struct {
 	Line, End int // from the defining line (not the doc comment) to the last
 	Doc       int // first line of its doc comment and decorators, if it has any (else 0)
 	Hits      []Hit
+	// Marked: context marks the definition (changed, in focus, failing),
+	// so it's listed first. Set by the caller.
+	Marked bool
+	// Test is set in ref mode when the hits name the definition shown and
+	// lie in a test: the test's name as a ref writes it (the group's own
+	// RefName, or an enclosing definition's). Set by the caller.
+	Test string
 }
 
 // RefName is the name as a ref writes it after the path: Name, or Name#N

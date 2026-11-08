@@ -19,6 +19,8 @@ import (
 	"github.com/Vaspyyy/prism/outline"
 	"github.com/Vaspyyy/prism/ref"
 	"github.com/Vaspyyy/prism/repo"
+	"github.com/Vaspyyy/prism/report"
+	"github.com/Vaspyyy/prism/work"
 	"github.com/Vaspyyy/seek/internal/files"
 	"github.com/Vaspyyy/seek/internal/group"
 	"github.com/Vaspyyy/seek/internal/render"
@@ -89,8 +91,10 @@ func refLike(o options) bool {
 // refSearch prints what a ref names: the definition, as -s shows one (doc
 // comment included), then the hits of its name elsewhere, grouped by the
 // definitions that contain them, without the definition itself. A line
-// stands for the innermost definition containing it.
-func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp refPattern, paths []string, color bool) int {
+// stands for the innermost definition containing it. Hits in tests are
+// labelled as tests that mention the name, and next: lines at the end
+// give the crux commands that run those tests.
+func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp refPattern, paths []string, color bool, bg *background) int {
 	r := rp.r
 	typed := strings.TrimSpace(o.pattern)
 	if r.Rev != "" {
@@ -137,7 +141,7 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 		listPaths(out, gs, o.null)
 		return exitCode(len(gs) > 0)
 	}
-	defFiles, inDefs, _ := refDefs(info, srcs, ts, m, p)
+	defFiles, inDefs, whole := refDefs(info, srcs, ts, m, p)
 	budget := 1 << 30
 	if o.budgetSet && o.budget > 0 {
 		budget = o.budget
@@ -147,24 +151,96 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 	roDefs := render.Options{Budget: budget - 1, Color: color, Bodies: true, Path: shown}
 	refs := ref.Refs(ts)
 	if o.defs {
+		// the definitions context marks first, all still shown
+		cx := bg.context()
+		markedFirst(m, refs, cx)
+		defFiles = refBlocks(defFiles, whole, ts, m, refs, cx)
+		roDefs.Mark = markFunc(cx)
+		// the marks first, then the lines (see lineFirst)
+		var l *render.Layout
+		if o.bodies {
+			l = render.Plan(defFiles, roDefs)
+			render.Marks(defFiles, l, roDefs)
+		} else {
+			for _, i := range m {
+				cx.Marks(refs[i].String())
+			}
+		}
 		fmt.Fprintf(out, "seek -d: %s: %s\n", typed, plural(len(m), "definition"))
 		if o.bodies {
-			render.Files(out, defFiles, roDefs)
+			render.Print(out, defFiles, l, roDefs)
 			return 0
 		}
 		for _, i := range m {
 			t := ts[i]
-			fmt.Fprintln(out, defLine(t.Path, refName(refs[i]), t.Line, t.End, sigOf(defFiles, t)))
+			name := refName(refs[i]) + work.Suffix(cx.Marks(refs[i].String()))
+			fmt.Fprintln(out, defLine(t.Path, name, t.Line, t.End, sigOf(defFiles, t)))
 		}
 		return 0
 	}
-	var defsOut bytes.Buffer
-	layout := render.Plan(defFiles, roDefs)
-	render.Print(&defsOut, defFiles, layout, roDefs)
-	reduced, _ := layout.Reduced(defFiles, roDefs)
-
 	rest, st := elsewhere(paths, p, inDefs, o.writes)
 	hits := countHits(rest)
+	render.Order(rest)
+	cx := bg.context() // loaded while the search ran
+	markedFirst(m, refs, cx)
+	defFiles = refBlocks(defFiles, whole, ts, m, refs, cx) // in the header's order
+	rank(rest, cx)
+	ms := testMentions(rest, word)
+	next := mentionNext(info, ms, word)
+
+	// the next: lines and the context: line on top fit the budget by giving
+	// up detail (hit lines, the definition's code), never a file listed
+	// (Prism's docs/output.md, rule 5): the hits' detail first, and with -b,
+	// which bounds the whole output, then the definition's
+	extra := len(next)
+	headMarks := false // the header names up to 3 definitions, with their marks
+	if len(m) <= 3 {
+		for _, i := range m {
+			headMarks = headMarks || len(cx.Peek(refs[i].String())) > 0
+		}
+	}
+	if headMarks || contextLine(cx, defFiles, rest) {
+		extra++
+	}
+	layout, defLines := planDefs(defFiles, roDefs)
+	used := 1 + defLines // the header
+	if rp.shadowed != "" {
+		used++
+	}
+	hitBudget := 100
+	if o.bodies {
+		hitBudget = 300
+	}
+	hitBudget-- // the header, as in a search
+	if o.budgetSet {
+		hitBudget = max(budget-used, 1) // -b bounds the whole output
+	}
+	ro := render.Options{Budget: hitBudget, Color: color, Context: o.context, Bodies: o.bodies, Counts: o.counts, Path: shown,
+		Mark: markFunc(cx), Mentions: word, Extra: extra}
+	var hl *render.Layout
+	hitLines := 0
+	if len(rest) > 0 {
+		hl = render.Plan(rest, ro)
+		hitLines = printedLines(rest, hl, ro)
+	}
+	// with -b, what's over it: the hits' least (a line per file) and the
+	// extra lines the hits had no detail for
+	if over := used + hitLines + extra - budget; o.budgetSet && over > 0 {
+		// the definition shows less code: as many lines fewer, if it has them
+		want := defLines - over
+		for b := roDefs.Budget - over; b >= 1; b-- {
+			ro := roDefs
+			ro.Budget = b
+			l, n := planDefs(defFiles, ro)
+			if layout = l; n <= want {
+				break
+			}
+		}
+	}
+	roDefs.Mark = markFunc(cx)
+	var defsOut bytes.Buffer
+	render.Print(&defsOut, defFiles, layout, roDefs)
+	reduced, _ := layout.Reduced(defFiles, roDefs)
 
 	describe := func(i int) string {
 		t := ts[i]
@@ -172,16 +248,17 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 		if t.End > t.Line {
 			rng += "-" + strconv.Itoa(t.End)
 		}
-		return fmt.Sprintf("%s (%s, %s)", refs[i], t.Kind, rng)
+		return fmt.Sprintf("%s%s (%s, %s)", refs[i], work.Suffix(cx.Marks(refs[i].String())), t.Kind, rng)
 	}
-	var ds []string
-	for _, i := range m {
-		ds = append(ds, describe(i))
+	what, sep := plural(len(m), "definition"), ", " // more than 3: shown below
+	if len(m) <= 3 {
+		var ds []string
+		for _, i := range m {
+			ds = append(ds, describe(i))
+		}
+		what = strings.Join(ds, ", ")
 	}
-	what, sep := strings.Join(ds, ", "), ", "
-	if len(m) > 3 {
-		what = plural(len(m), "definition") // shown below
-	} else if len(m) > 1 {
+	if len(m) > 1 && len(m) <= 3 {
 		sep = "; " // after a list
 	}
 	switch {
@@ -217,34 +294,50 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 	if len(o.paths) > 0 || len(o.globs) > 0 {
 		then += " (searched " + scopeOf(o, st) + ")"
 	}
+	if hl != nil {
+		render.Marks(rest, hl, ro) // before the first line: see lineFirst
+	}
 	fmt.Fprintf(out, "seek: %s%s%s\n", what, sep, then)
-	used := 1 + bytes.Count(defsOut.Bytes(), []byte{'\n'})
 	if rp.shadowed != "" {
 		fmt.Fprintf(out, "(%s is read from the repository root, not as %s)\n", rp.files[0], rp.shadowed)
-		used++
 	}
 	out.Write(defsOut.Bytes())
 	if reduced > 0 {
-		fmt.Fprintln(out, "(the definition is shortened to fit the budget; raise -b, or -b 0 for no limit)")
-		used++
+		fmt.Fprintln(out, shortened)
 	}
 	if len(rest) == 0 {
 		return 0
 	}
-	hitBudget := 100
-	if o.bodies {
-		hitBudget = 300
-	}
-	hitBudget-- // the header, as in a search
-	if o.budgetSet {
-		hitBudget = max(budget-used, 1) // -b bounds the whole output
-	}
-	ro := render.Options{Budget: hitBudget, Color: color, Context: o.context, Bodies: o.bodies, Counts: o.counts, Path: shown}
-	render.Order(rest)
-	hl := render.Plan(rest, ro)
 	render.Print(out, rest, hl, ro)
 	notes(out, hl, rest, ro)
+	for _, l := range report.NextLines(next) {
+		fmt.Fprintln(out, l)
+	}
 	return 0
+}
+
+// shortened is the note under a definition the budget didn't fit whole.
+const shortened = "(the definition is shortened to fit the budget; raise -b, or -b 0 for no limit)"
+
+// planDefs plans how much of the definitions a ref names is shown, and how
+// many lines that takes, the note that it's shortened included.
+func planDefs(defFiles []*group.File, ro render.Options) (*render.Layout, int) {
+	l := render.Plan(defFiles, ro)
+	return l, printedLines(defFiles, l, ro)
+}
+
+// printedLines is how many lines files take as planned, a note that the
+// budget shortened them included. It prints nothing, so it hands out no
+// marks.
+func printedLines(files []*group.File, l *render.Layout, ro render.Options) int {
+	ro.Mark = nil
+	var b bytes.Buffer
+	render.Print(&b, files, l, ro)
+	n := bytes.Count(b.Bytes(), []byte{'\n'})
+	if reduced, _ := l.Reduced(files, ro); reduced > 0 {
+		n++
+	}
+	return n
 }
 
 // readSources reads the files a ref names and lists their definitions as

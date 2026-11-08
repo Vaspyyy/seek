@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Vaspyyy/prism/ref"
 	"github.com/Vaspyyy/seek/internal/group"
 	"github.com/Vaspyyy/seek/internal/search"
 )
@@ -26,6 +27,18 @@ type Options struct {
 	// Path turns a file's path into the one printed (repo-relative); nil
 	// prints it as it is
 	Path func(string) string
+	// Mark is what a definition gets after its name, given its ref: its
+	// context marks (" [changed]"), or "". It's called only for the names
+	// printed. nil: no marks.
+	Mark func(ref string) string
+	// Mentions is the name the hits are of in ref mode: groups with a Test
+	// are labelled "(test, mentions Name)".
+	Mentions string
+	// Extra is lines the caller prints besides the files (the context:
+	// line, next: lines). They come out of the detail Budget would give
+	// (hit lines, code), never out of the files and definitions listed;
+	// with no detail to give up, they go on top of it.
+	Extra int
 }
 
 type palette struct{ bold, faint, path, sym, match, label, reset string }
@@ -99,7 +112,12 @@ func (o Options) path(p string) string {
 type Layout struct {
 	level []int // per shown file: 1 one line, 2 a line per definition, 3 hit lines, 4 whole definitions
 	ctx   []int // per shown file with -C: the context lines that fit (at most -C)
+	over  int   // the Extra lines that didn't fit: they go on top of the budget
 }
+
+// Over is how many of the Extra lines found no detail to give up and go
+// on top of the budget.
+func (l *Layout) Over() int { return l.over }
 
 // Reduced counts the shown files that didn't get what -s or -C asked for
 // (whole definitions, context lines), of all shown files that could have.
@@ -183,6 +201,9 @@ func Plan(files []*group.File, o Options) *Layout {
 		top = 5
 	}
 	for lv := 2; lv <= min(top, 3); lv++ {
+		if lv == 3 {
+			room -= o.Extra // from here on it's detail: lines that show more of what's listed
+		}
 		for i := range level {
 			if files[i].Kind != "" || level[i] != lv-1 {
 				continue // lock, generated and vendored files stay on one line
@@ -206,7 +227,10 @@ func Plan(files []*group.File, o Options) *Layout {
 			}
 		}
 	}
-	l := &Layout{level: level}
+	if top < 3 {
+		room -= o.Extra // -c: no detail; only room left over takes them
+	}
+	l := &Layout{level: level, over: max(-room, 0)}
 	if o.Context > 0 {
 		l.ctx = ctx
 	}
@@ -237,6 +261,29 @@ func Print(out io.Writer, files []*group.File, l *Layout, o Options) {
 			more = fmt.Sprintf(", +%d more", n-len(names))
 		}
 		w.line("%s… %s with %s: %s%s (raise -b, or narrow with -g or a path)%s", w.c.faint, plural(n, "more file"), plural(hits, "hit"), strings.Join(names, ", "), more, w.c.reset)
+	}
+}
+
+// Marks hands out the marks of the names Print prints (o.Mark), without
+// printing: for a caller that writes the context: line, which names only
+// marks the report shows, before the files.
+func Marks(files []*group.File, l *Layout, o Options) {
+	if o.Mark == nil {
+		return
+	}
+	w := &writer{o: o}
+	for i, lv := range l.level {
+		f := files[i]
+		switch lv = max(lv, 1); {
+		case lv == 1 && f.Kind != "": // its hits' lines, no names
+		case lv == 1 && f.Outlined && len(f.Groups) > 0:
+			w.topGroups(f, 4)
+		case lv == 1 || lv == 2 && !f.Outlined: // line numbers only
+		default:
+			for _, g := range f.Groups {
+				w.marks(f, g)
+			}
+		}
 	}
 }
 
@@ -321,7 +368,7 @@ func (w *writer) file(f *group.File, lv int) {
 		w.line("%s: L%s", head, joinCapped(ls, 8))
 		return
 	case lv == 1 && f.Outlined && len(f.Groups) > 0:
-		w.line("%s in %s: %s", head, plural(len(f.Groups), "place"), w.topGroups(f, 4))
+		w.line("%s in %s: %s", head, w.places(f), w.topGroups(f, 4))
 		return
 	case lv == 1 || lv == 2 && !f.Outlined:
 		var ls []string
@@ -339,11 +386,11 @@ func (w *writer) file(f *group.File, lv int) {
 	for _, g := range f.Groups {
 		ind := "  "
 		if lv == 2 {
-			w.line("  %s  %s", w.groupHead(g), w.groupCount(g))
+			w.line("  %s  %s", w.groupHead(f, g), w.groupCount(g))
 			continue
 		}
 		if f.Outlined {
-			w.line("  %s", w.groupHead(g))
+			w.line("  %s", w.groupHead(f, g))
 			ind = "    "
 		}
 		common := commonIndent(g)
@@ -436,7 +483,7 @@ func lastLine(f *group.File) int {
 	return min(n, f.Lines)
 }
 
-func (w *writer) groupHead(g *group.Group) string {
+func (w *writer) groupHead(f *group.File, g *group.Group) string {
 	c := w.c
 	if g.Sym < 0 {
 		return c.faint + "(top level)" + c.reset
@@ -447,7 +494,64 @@ func (w *writer) groupHead(g *group.Group) string {
 	if g.End > g.Line {
 		rng += "-" + strconv.Itoa(g.End)
 	}
-	return fmt.Sprintf("%s %s%s%s  %s", g.Kind, c.sym, g.RefName(), c.reset, rng)
+	s := fmt.Sprintf("%s %s%s%s%s  %s", g.Kind, c.sym, g.RefName(), c.reset, w.marks(f, g), rng)
+	if t := w.testLabel(g); t != "" {
+		s += "  " + c.label + "(" + t + ")" + c.reset
+	}
+	return s
+}
+
+// marks is a group's context marks, as printed after its name: " [focus]".
+func (w *writer) marks(f *group.File, g *group.Group) string {
+	if w.o.Mark == nil || g.Sym < 0 {
+		return ""
+	}
+	return w.o.Mark(ref.Symbol(w.path(f), g.Name, g.Ordinal).String())
+}
+
+// testLabel says that a group is in a test whose hits name the definition
+// shown (ref mode): "test, mentions List", or "in test TestList, mentions
+// List" for a definition nested in the test. Only "mentions": the test
+// names it, which doesn't say what it tests (Prism's docs/evidence.md).
+func (w *writer) testLabel(g *group.Group) string {
+	switch {
+	case g.Test == "" || w.o.Mentions == "":
+		return ""
+	case g.Test == g.RefName():
+		return "test, mentions " + w.o.Mentions
+	}
+	return "in test " + g.Test + ", mentions " + w.o.Mentions
+}
+
+// places is how a file's one line counts its groups: "3 places", or, in
+// ref mode, "2 tests that mention List" when they're all tests, else
+// "3 places (2 tests that mention List)".
+func (w *writer) places(f *group.File) string {
+	s := plural(len(f.Groups), "place")
+	if w.o.Mentions == "" {
+		return s
+	}
+	tests := map[string]bool{}
+	own := 0
+	for _, g := range f.Groups {
+		if g.Test != "" {
+			tests[g.Test] = true
+			if g.Test == g.RefName() {
+				own++
+			}
+		}
+	}
+	verb := " that mention "
+	if len(tests) == 1 {
+		verb = " that mentions "
+	}
+	switch {
+	case len(tests) == 0:
+		return s
+	case own == len(f.Groups):
+		return plural(len(tests), "test") + verb + w.o.Mentions
+	}
+	return s + " (" + plural(len(tests), "test") + verb + w.o.Mentions + ")"
 }
 
 // groupCount is a definition's hits on one line: "14 hits (1 assignment): L11678, L11687, …".
@@ -495,12 +599,18 @@ func labelCount(l string, n int) string {
 }
 
 // topGroups names the definitions with the most hits: "tick 9, render 7".
+// The ones context marks come first.
 func (w *writer) topGroups(f *group.File, n int) string {
 	gs := append([]*group.Group(nil), f.Groups...)
-	sort.SliceStable(gs, func(i, j int) bool { return len(gs[i].Hits) > len(gs[j].Hits) })
+	sort.SliceStable(gs, func(i, j int) bool {
+		if gs[i].Marked != gs[j].Marked {
+			return gs[i].Marked
+		}
+		return len(gs[i].Hits) > len(gs[j].Hits)
+	})
 	var parts []string
 	for _, g := range gs[:min(n, len(gs))] {
-		name := g.RefName()
+		name := g.RefName() + w.marks(f, g)
 		if g.Sym < 0 {
 			name = "(top level)"
 		}

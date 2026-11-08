@@ -90,9 +90,30 @@ glint, seek, recap and crux name files, symbols and locations the same way, so a
 
 Paths are relative to the repository root. The format is specified in [Prism](https://github.com/Vaspyyy/prism/blob/main/docs/refs.md).
 
+## Context
+
+seek knows what you're working on without being told. A definition changed in the working tree gets `[changed]` after its name, one committed on this branch `[branch]`, one changed in the commit [recap](https://github.com/Vaspyyy/recap) last showed `[focus]`, and one that failed in [crux](https://github.com/Vaspyyy/crux)'s last run `[failing]`, wherever seek names it: group lines (`func List [focus]  L73-107`), ref mode's header, `-d`. Marked definitions also come first: in each file, files with them before the other files, and among several definitions of one name. Context only orders and marks; it never leaves a hit out. When it marked or reordered anything, the first line says what it used:
+
+```
+context: 1 changed symbol vs HEAD; focus: commit b681ef1 (recap, 4 min ago)
+```
+
+In ref mode, hits in Go, pytest and Rust tests are labelled as such, and `next:` lines at the end give the crux command that runs those tests. When the command can also run other tests (a test with the same name in another package it lists), the reason says so:
+
+```
+internal/files/files_test.go  31 lines
+  func TestList  L9-31  (test, mentions List)
+    12 got, err := List([]string{dir}, Options{})
+next: crux go test -run '^TestList$' ./internal/files/   runs the 1 test that mentions List
+```
+
+"mentions" is all seek knows: the test names `List`, which doesn't say it tests it. The labels and `next:` lines come from the result, not from context. The `context:` line and `next:` lines fit in the line budget by giving up detail (hit lines, code), never a file that would be listed; when there's no detail left to give up, they go on top of it.
+
+`--no-context` (or `PRISM_NO_CONTEXT=1`) ignores context and records nothing: the output is the same minus the marks and the `context:` line. It's for scripts and tests that compare outputs; correct results never need it. Context is [Prism's](https://github.com/Vaspyyy/prism/blob/main/docs/context.md), shared with glint, recap and crux, and costs a few milliseconds of git, run while seek searches.
+
 ## JSON
 
-`seek --json` prints one JSON document instead of the text, for programs, in every mode (refs, `-d` and `-l` included). It holds every hit, grouped by file and by the definition that contains it (`null` outside any). Each definition has its ref, its lines, its doc comment's lines and its signature. Each hit has its line, the column of its first match, its text (the line without its indentation) and its label. The line budget doesn't apply unless `-b N` is given, which lists at most N hits. Errors are a JSON document on stdout too: a ref that names nothing gives `no_match` with the refs it may have meant, and bad arguments give `usage`. The exit status is the same as without `--json`. The shape is Prism's envelope with a `report.Seek` result, shared with glint, recap and crux, and specified in [Prism](https://github.com/Vaspyyy/prism/blob/main/docs/output.md).
+`seek --json` prints one JSON document instead of the text, for programs, in every mode (refs, `-d` and `-l` included). It holds every hit, grouped by file and by the definition that contains it (`null` outside any). Each definition has its ref, its lines, its doc comment's lines, its signature and its context marks. Each hit has its line, the column of its first match, its text (the line without its indentation) and its label. The line budget doesn't apply unless `-b N` is given, which lists at most N hits. `context` says what context was available and what it did (`null` with `--no-context`); in ref mode, `links` has a `mentions` link from each test to the definition, and `next` the commands of the `next:` lines. Errors are a JSON document on stdout too: a ref that names nothing gives `no_match` with the refs it may have meant, and bad arguments give `usage`. The exit status is the same as without `--json`. The shape is Prism's envelope with a `report.Seek` result, shared with glint, recap and crux, and specified in [Prism](https://github.com/Vaspyyy/prism/blob/main/docs/output.md).
 
 Text stays the default, and it's what agents should read: it's shorter, and it says what it left out.
 
