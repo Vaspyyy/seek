@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Vaspyyy/prism/repo"
+	"github.com/Vaspyyy/prism/report"
 	"github.com/Vaspyyy/seek/internal/files"
 	"github.com/Vaspyyy/seek/internal/group"
 	"github.com/Vaspyyy/seek/internal/render"
@@ -59,6 +60,8 @@ grouped as usual. With -F or -e the pattern is always a pattern.
   -b N        about how many lines to print (default 100, with -s 300; 0: no limit)
   -e PATTERN  a pattern that starts with "-" (or that isn't a ref)
   -A          plain output without colors (the default when not on a terminal)
+  --json      one JSON document instead of the text (Prism's report.Seek):
+              every hit, with no line budget unless -b N is given (N hits)
   --version
 
 Files are what git sees in a repository (tracked and untracked, not
@@ -78,6 +81,7 @@ type options struct {
 	so                         search.Options
 	plain, unrestrict, null    bool
 	writes                     bool
+	json                       bool
 }
 
 func main() {
@@ -93,6 +97,9 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 		if code == 0 {
 			fmt.Fprint(out, msg)
 			return 0
+		}
+		if o.json || jsonFlag(args) { // parse may stop before it reads --json
+			return failJSON(out, args, detect()(), report.CodeUsage, msg, nil, code)
 		}
 		fmt.Fprintln(errw, "seek: "+msg)
 		return code
@@ -111,10 +118,16 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	}
 	paths, err := files.List(roots, files.Options{Globs: o.globs, Unrestrict: o.unrestrict})
 	if err != nil {
+		if o.json {
+			return failJSON(out, args, detected(), report.CodeFailed, err.Error(), nil, 2)
+		}
 		fmt.Fprintln(errw, "seek: "+err.Error())
 		return 2
 	}
 	if isRef {
+		if o.json {
+			return refJSON(out, args, o, info, t, paths)
+		}
 		return refSearch(out, errw, o, info, t, paths, color)
 	}
 	expr := o.pattern
@@ -123,6 +136,9 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	}
 	p, err := search.Compile(expr, o.so)
 	if err != nil {
+		if o.json {
+			return failJSON(out, args, detected(), report.CodeFailed, err.Error(), nil, 2)
+		}
 		fmt.Fprintln(errw, "seek: "+err.Error())
 		return 2
 	}
@@ -139,6 +155,9 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	}
 	if o.list && o.defs {
 		gs = definingFiles(o, p, gs)
+	}
+	if o.json {
+		return searchJSON(out, args, o, p, gs, allHits, paths, detected())
 	}
 	if o.list {
 		sort.Slice(gs, func(i, j int) bool { return gs[i].Path < gs[j].Path })
@@ -446,11 +465,16 @@ func missed(o options, p *search.Pattern, paths []string, wholeLines int) missed
 }
 
 func (m missedHits) note(pattern string) string {
-	s := fmt.Sprintf("+%s %s (%s)", plural(m.lines, "more hit"), m.what, m.words)
+	s := m.why()
 	if cmd := command(m.flags, pattern); cmd != "" {
 		s += ": " + cmd
 	}
 	return s
+}
+
+// why says what the hits left out are: "+11 more hits in another case (…)".
+func (m missedHits) why() string {
+	return fmt.Sprintf("+%s %s (%s)", plural(m.lines, "more hit"), m.what, m.words)
 }
 
 // command is a seek command line to suggest, or "" if the pattern is too
@@ -495,7 +519,7 @@ func writesOnly(gs []*group.File) []*group.File {
 		for _, g := range f.Groups {
 			var hs []group.Hit
 			for _, h := range g.Hits {
-				if (h.Label == "definition" || h.Label == "declaration" || h.Label == "assignment") && !readsOnly(h) {
+				if setsName(h) {
 					hs = append(hs, h)
 				}
 			}
@@ -510,6 +534,12 @@ func writesOnly(gs []*group.File) []*group.File {
 		}
 	}
 	return out
+}
+
+// setsName: the hit sets the name (a definition, declaration or
+// assignment that isn't only a read).
+func setsName(h group.Hit) bool {
+	return (h.Label == "definition" || h.Label == "declaration" || h.Label == "assignment") && !readsOnly(h)
 }
 
 // getter matches a JavaScript getter's first line, up to its name.
@@ -661,8 +691,9 @@ func defsLine(gs []*group.File, n int, p *search.Pattern, l *render.Layout) stri
 	return strings.Join(parts, ", ")
 }
 
-// definitions prints -d: one line per definition, or with -s each one whole.
-func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.File, scope string, ro render.Options, paths []string, searched string) int {
+// keptDefs are the definitions -d lists, per file, in the order it lists
+// them; total counts them, others the other hits.
+func keptDefs(o options, p *search.Pattern, gs []*group.File) (defFiles []*group.File, total, others int) {
 	want := strings.Split(o.pattern, "|")
 	keep := func(name string) bool {
 		if !p.Smart {
@@ -688,8 +719,6 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 		}
 		return false
 	}
-	var defFiles []*group.File
-	total, others := 0, 0
 	for _, f := range gs {
 		var kept []group.Def
 		for _, d := range f.Defs {
@@ -715,6 +744,12 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 		}
 		return ownDef(a) && !ownDef(b) // the trait or type itself, then its impls
 	})
+	return defFiles, total, others
+}
+
+// definitions prints -d: one line per definition, or with -s each one whole.
+func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.File, scope string, ro render.Options, paths []string, searched string) int {
+	defFiles, total, others := keptDefs(o, p, gs)
 	have := map[string]bool{}
 	for _, f := range defFiles {
 		for _, d := range f.Defs {
@@ -1124,6 +1159,8 @@ func parse(args []string) (options, int, string) {
 			o.so.Partial = true
 		case a == "--writes":
 			o.writes = true
+		case a == "--json":
+			o.json = true
 		case a == "-e":
 			var s string
 			if s, msg = value(&i, "-e"); msg == "" {

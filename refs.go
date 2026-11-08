@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -113,19 +114,10 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 		fmt.Fprintf(out, "seek: %s: %s end in %s; name one: %s\n", typed, plural(len(rp.files), "path"), r.Path, capped(locs, 8))
 		return 1
 	}
-	var srcs []source
-	var ts []ref.Target
-	for _, rel := range rp.files {
-		data, why := search.Read(info.Abs(rel))
-		if why != "" {
-			if len(rp.files) == 1 {
-				fmt.Fprintf(errw, "seek: %s is %s\n", rel, why)
-				return 2
-			}
-			continue
-		}
-		srcs = append(srcs, source{rel: rel, data: data, at: len(ts)})
-		ts = append(ts, ref.Targets(rel, group.Symbols(rel, data))...)
+	srcs, ts, why := readSources(info, rp.files)
+	if why != "" {
+		fmt.Fprintln(errw, "seek: "+why)
+		return 2
 	}
 	m := ref.Match(r, ts, rp.files)
 	if len(m) == 0 && r.IsLocation() {
@@ -135,60 +127,17 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 		return noDefinition(out, typed, r, ts, rp.files)
 	}
 
-	word := nameWord(ts[m[0]])
-	so := o.so
-	so.Fixed = true
-	p, err := search.Compile(word, so)
+	word, so, p, err := namePattern(o, ts[m[0]])
 	if err != nil {
 		fmt.Fprintln(errw, "seek: "+err.Error())
 		return 2
 	}
-	defined := map[string]bool{}
-	for _, i := range m {
-		defined[ts[i].Path] = true
-	}
 	if o.list {
-		found, _ := search.Run(paths, p)
-		gs := buildAll(found, p)
-		if o.defs { // -l -d: the files that define it
-			var keep []*group.File
-			for _, f := range gs {
-				if defined[shown(f.Path)] {
-					keep = append(keep, f)
-				}
-			}
-			gs = keep
-		}
-		sort.Slice(gs, func(i, j int) bool { return gs[i].Path < gs[j].Path })
+		gs := refFiles(paths, p, ts, m, o.defs)
 		listPaths(out, gs, o.null)
 		return exitCode(len(gs) > 0)
 	}
-
-	// the definitions, each with the hits of its name inside it
-	var defFiles []*group.File
-	inDefs := map[string][][2]int{} // their lines (doc comments included), per file
-	for _, s := range srcs {
-		if !defined[s.rel] {
-			continue
-		}
-		abs := info.Abs(s.rel)
-		sf := &search.File{Path: abs, Data: s.data, Lines: search.CountLines(s.data)}
-		if found, _ := search.Run([]string{abs}, p); len(found) > 0 {
-			sf = found[0]
-		}
-		sf.Kind = search.Kind(s.rel, s.data) // the repository's folders, not the ones above it
-		gf := group.Build(sf, p)
-		c := *gf
-		c.Groups = nil
-		for _, i := range m {
-			if ts[i].Path == s.rel {
-				g := gf.Whole(i - s.at)
-				c.Groups = append(c.Groups, g)
-				inDefs[s.rel] = append(inDefs[s.rel], [2]int{g.First(), max(g.End, g.Line)})
-			}
-		}
-		defFiles = append(defFiles, &c)
-	}
+	defFiles, inDefs, _ := refDefs(info, srcs, ts, m, p)
 	budget := 1 << 30
 	if o.budgetSet && o.budget > 0 {
 		budget = o.budget
@@ -214,17 +163,7 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 	render.Print(&defsOut, defFiles, layout, roDefs)
 	reduced, _ := layout.Reduced(defFiles, roDefs)
 
-	// the hits elsewhere: callers and mentions
-	found, st := search.Run(paths, p)
-	var rest []*group.File
-	for _, f := range buildAll(found, p) {
-		if f = without(f, inDefs[shown(f.Path)]); f != nil {
-			rest = append(rest, f)
-		}
-	}
-	if o.writes {
-		rest = writesOnly(rest)
-	}
+	rest, st := elsewhere(paths, p, inDefs, o.writes)
 	hits := countHits(rest)
 
 	describe := func(i int) string {
@@ -306,6 +245,105 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 	render.Print(out, rest, hl, ro)
 	notes(out, hl, rest, ro)
 	return 0
+}
+
+// readSources reads the files a ref names and lists their definitions as
+// targets. A file that isn't searched (binary, too big) is left out; why
+// says so when it's the only one.
+func readSources(info *repo.Info, files []string) (srcs []source, ts []ref.Target, why string) {
+	for _, rel := range files {
+		data, skip := search.Read(info.Abs(rel))
+		if skip != "" {
+			if len(files) == 1 {
+				return nil, nil, rel + " is " + skip
+			}
+			continue
+		}
+		srcs = append(srcs, source{rel: rel, data: data, at: len(ts)})
+		ts = append(ts, ref.Targets(rel, group.Symbols(rel, data))...)
+	}
+	return srcs, ts, ""
+}
+
+// namePattern is what ref mode searches for: the name of the definition
+// the ref names, as plain text, with the search options given.
+func namePattern(o options, t ref.Target) (string, search.Options, *search.Pattern, error) {
+	word := nameWord(t)
+	so := o.so
+	so.Fixed = true
+	p, err := search.Compile(word, so)
+	return word, so, p, err
+}
+
+// refFiles are the files with hits of the name (-l), in path order; with
+// defs, only those that define it (-l -d).
+func refFiles(paths []string, p *search.Pattern, ts []ref.Target, m []int, defs bool) []*group.File {
+	defined := map[string]bool{}
+	for _, i := range m {
+		defined[ts[i].Path] = true
+	}
+	found, _ := search.Run(paths, p)
+	gs := buildAll(found, p)
+	if defs {
+		var keep []*group.File
+		for _, f := range gs {
+			if defined[shown(f.Path)] {
+				keep = append(keep, f)
+			}
+		}
+		gs = keep
+	}
+	sort.Slice(gs, func(i, j int) bool { return gs[i].Path < gs[j].Path })
+	return gs
+}
+
+// refDefs are the definitions a ref names, per file, each as a group with
+// the hits of its name inside it; their lines (doc comments included), per
+// file; and each one's group by its index in ts.
+func refDefs(info *repo.Info, srcs []source, ts []ref.Target, m []int, p *search.Pattern) ([]*group.File, map[string][][2]int, map[int]*group.Group) {
+	var defFiles []*group.File
+	inDefs := map[string][][2]int{}
+	whole := map[int]*group.Group{}
+	for _, s := range srcs {
+		if !slices.ContainsFunc(m, func(i int) bool { return ts[i].Path == s.rel }) {
+			continue
+		}
+		abs := info.Abs(s.rel)
+		sf := &search.File{Path: abs, Data: s.data, Lines: search.CountLines(s.data)}
+		if found, _ := search.Run([]string{abs}, p); len(found) > 0 {
+			sf = found[0]
+		}
+		sf.Kind = search.Kind(s.rel, s.data) // the repository's folders, not the ones above it
+		gf := group.Build(sf, p)
+		c := *gf
+		c.Groups = nil
+		for _, i := range m {
+			if ts[i].Path == s.rel {
+				g := gf.Whole(i - s.at)
+				c.Groups = append(c.Groups, g)
+				inDefs[s.rel] = append(inDefs[s.rel], [2]int{g.First(), max(g.End, g.Line)})
+				whole[i] = g
+			}
+		}
+		defFiles = append(defFiles, &c)
+	}
+	return defFiles, inDefs, whole
+}
+
+// elsewhere are the hits of the name outside the definitions shown: its
+// callers and mentions (with writes, only the hits that set it).
+func elsewhere(paths []string, p *search.Pattern, inDefs map[string][][2]int, writes bool) ([]*group.File, search.Stats) {
+	found, st := search.Run(paths, p)
+	var rest []*group.File
+	for _, f := range buildAll(found, p) {
+		if f = without(f, inDefs[shown(f.Path)]); f != nil {
+			rest = append(rest, f)
+		}
+	}
+	if writes {
+		rest = writesOnly(rest)
+	}
+	return rest, st
 }
 
 // without is f without the hits on the given lines (the definitions shown
@@ -418,15 +456,8 @@ func noDefinition(out *bufio.Writer, typed string, r ref.Ref, ts []ref.Target, f
 		where = fmt.Sprintf("the %d files whose paths end in %s", len(files), r.Path)
 	}
 	fmt.Fprintf(out, "seek: %s: no definition named %q in %s\n", typed, refName(r), where)
-	refs := ref.Refs(ts)
 	part := lastPart(r.Name)
-	var near, all []string
-	for i, t := range ts {
-		all = append(all, refs[i].String())
-		if strings.Contains(strings.ToLower(t.Name), strings.ToLower(part)) {
-			near = append(near, refs[i].String())
-		}
-	}
+	near, all := candidates(r, ts)
 	switch {
 	case len(near) > 0:
 		fmt.Fprintf(out, "  names that contain %q: %s\n", part, capped(near, 8))
@@ -441,6 +472,20 @@ func noDefinition(out *bufio.Writer, typed string, r ref.Ref, ts []ref.Target, f
 		fmt.Fprintf(out, "  to search for it as text: %s\n", cmd)
 	}
 	return 1
+}
+
+// candidates are the refs of the definitions a ref that names none may
+// have meant: near, whose names contain its name's last part, and all.
+func candidates(r ref.Ref, ts []ref.Target) (near, all []string) {
+	refs := ref.Refs(ts)
+	part := strings.ToLower(lastPart(r.Name))
+	for i, t := range ts {
+		all = append(all, refs[i].String())
+		if strings.Contains(strings.ToLower(t.Name), part) {
+			near = append(near, refs[i].String())
+		}
+	}
+	return near, all
 }
 
 // capped joins the first n items and says how many more there are.
