@@ -4,7 +4,6 @@
 package group
 
 import (
-	"bytes"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -103,41 +102,24 @@ func (f *File) Labelled(label string) int {
 }
 
 // Symbols is the outline of a file as Build sees it, so a symbol's index
-// is the same in both: what the outline rules find, without definitions
-// inside docstrings and template strings. nil if the file type has no
-// outline rules.
+// is the same in both, and the same as in glint, recap and crux: what
+// outline.Parse finds (it drops definitions inside docstrings, template
+// strings and other text that spans lines, on the lines outline.Multiline
+// labels). nil if the file type has no outline rules.
 func Symbols(path string, data []byte) []outline.Symbol {
 	if !outline.Supported(path) || search.Kind(path, data) == "minified" {
 		return nil
 	}
-	inText, _ := multiline(path, data)
-	return realSymbols(outline.Parse(path, data, 1<<20), inText)
-}
-
-// realSymbols drops the definitions the outline found inside a docstring
-// or a template string: they aren't real.
-func realSymbols(syms []outline.Symbol, inText map[int]string) []outline.Symbol {
-	if len(inText) == 0 {
-		return syms
-	}
-	var keep []outline.Symbol
-	for _, s := range syms {
-		if inText[s.Line] == "" {
-			keep = append(keep, s)
-		}
-	}
-	if len(keep) < len(syms) {
-		return reparent(keep)
-	}
-	return syms
+	return outline.Parse(path, data, 1<<20)
 }
 
 // Build groups f's hits.
 func Build(f *search.File, p *search.Pattern) *File {
 	out := &File{File: f}
-	inText, inCode := multiline(f.Path, f.Data)
+	text := outline.Multiline(f.Path, f.Data) // the lines inside strings and comments that span lines
+	inText, inCode := text.In, text.Code
 	if outline.Supported(f.Path) && f.Kind != "minified" {
-		out.Syms = realSymbols(outline.Parse(f.Path, f.Data, 1<<20), inText)
+		out.Syms = outline.Parse(f.Path, f.Data, 1<<20)
 		out.Outlined = true
 	}
 	st := styleOf(f.Path)
@@ -156,7 +138,7 @@ func Build(f *search.File, p *search.Pattern) *File {
 				}
 			}
 			if l == "string" && anyWithin(h.Spans, inCode[h.Line]) {
-				l = "" // code in a template's ${…}: one hit in code decides
+				l = "" // code in a template's ${…} (or a shell "$(…)"): one hit in code decides
 			}
 			g := groupFor(out, byKey, si)
 			g.Hits = append(g.Hits, Hit{Hit: h, Label: l})
@@ -247,7 +229,7 @@ func Build(f *search.File, p *search.Pattern) *File {
 func (f *File) Whole(i int) *Group {
 	s := f.Syms[i]
 	g := &Group{Sym: i, Kind: s.Kind, Name: outline.Qualified(f.Syms, i), Ordinal: f.ordinal(i), Sig: s.Sig, Line: s.Line, End: s.End}
-	inText, _ := multiline(f.Path, f.Data)
+	inText := outline.Multiline(f.Path, f.Data).In
 	if d := docStart(strings.Split(string(f.Data), "\n"), s.Line, styleOf(f.Path), inText); d < s.Line {
 		g.Doc = d
 	}
@@ -358,145 +340,6 @@ func groupFor(out *File, byKey map[int]*Group, si int) *Group {
 		out.Groups = append(out.Groups, g)
 	}
 	return g
-}
-
-// reparent recomputes parents after symbols were dropped.
-func reparent(syms []outline.Symbol) []outline.Symbol {
-	for i := range syms {
-		syms[i].Parent = -1
-		for j := i - 1; j >= 0; j-- {
-			if syms[j].Line < syms[i].Line && syms[j].End >= syms[i].End && syms[j].End > syms[j].Line {
-				syms[i].Parent = j
-				break
-			}
-		}
-	}
-	return syms
-}
-
-// multiline labels the lines inside strings and comments that span lines:
-// Python's triple-quoted strings (docstrings), backtick strings in
-// JavaScript, TypeScript and Go, and /* … */ comments in C-like languages.
-// The opening line isn't labelled (code may come before the mark); the
-// lines after it up to the closing one are. The second map holds the
-// ${…} parts of those lines in a template literal, which are code.
-func multiline(path string, data []byte) (map[int]string, map[int][][2]int) {
-	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
-	type mark struct{ open, close, label string }
-	block := mark{"/*", "*/", "comment"}
-	var marks []mark
-	hash, jsLike := false, false
-	switch ext {
-	case "py", "pyi":
-		marks, hash = []mark{{`"""`, `"""`, "string"}, {`'''`, `'''`, "string"}}, true
-	case "js", "mjs", "cjs", "ts", "tsx", "jsx", "mts", "cts", "go":
-		marks = []mark{{"`", "`", "string"}, block}
-		jsLike = ext != "go"
-	case "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "java", "cs", "rs", "kt", "kts", "scala", "swift", "css", "scss", "less", "php", "dart", "zig", "glsl", "wgsl", "hlsl":
-		marks = []mark{block}
-	default:
-		return nil, nil
-	}
-	var in map[int]string
-	var code map[int][][2]int
-	var open *mark
-	n := 0
-	for len(data) > 0 {
-		n++
-		line := data
-		if end := bytes.IndexByte(data, '\n'); end >= 0 {
-			line, data = data[:end], data[end+1:]
-		} else {
-			data = nil
-		}
-		if open != nil {
-			if in == nil {
-				in = map[int]string{}
-			}
-			in[n] = open.label
-		}
-		s := string(line)
-		for i := 0; i < len(s); {
-			if open != nil {
-				switch {
-				case s[i] == '\\' && open.open == "`":
-					i += 2
-				case open.open == "`" && jsLike && strings.HasPrefix(s[i:], "${"):
-					end := interpEnd(s, i+2)
-					if end < 0 {
-						i += 2
-						continue
-					}
-					if code == nil {
-						code = map[int][][2]int{}
-					}
-					code[n] = append(code[n], [2]int{i + 2, end})
-					i = end + 1
-				case strings.HasPrefix(s[i:], open.close):
-					i += len(open.close)
-					open = nil
-				default:
-					i++
-				}
-				continue
-			}
-			if hash && s[i] == '#' || !hash && strings.HasPrefix(s[i:], "//") {
-				break // a line comment
-			}
-			if s[i] == '\\' {
-				i += 2
-				continue
-			}
-			if s[i] == '/' && jsLike && i+1 < len(s) && s[i+1] != '/' && s[i+1] != '*' && regexStart(s[:i]) {
-				if end := regexEnd(s, i); end > 0 {
-					i = end // a regex literal: its quotes and backticks open nothing
-					continue
-				}
-			}
-			found := false
-			for k := range marks {
-				if strings.HasPrefix(s[i:], marks[k].open) {
-					open, i, found = &marks[k], i+len(marks[k].open), true
-					break
-				}
-			}
-			if found {
-				continue
-			}
-			if s[i] == '"' || s[i] == '\'' && ext != "rs" {
-				// a one-line string: its quotes don't open anything
-				q, j := s[i], i+1
-				for j < len(s) && s[j] != q {
-					if s[j] == '\\' {
-						j++
-					}
-					j++
-				}
-				i = j + 1
-				continue
-			}
-			i++
-		}
-	}
-	return in, code
-}
-
-// interpEnd is the index of the } that closes a ${ whose contents start at
-// s[i], or -1 if it doesn't close on this line.
-func interpEnd(s string, i int) int {
-	depth := 0
-	for ; i < len(s); i++ {
-		switch s[i] {
-		case '{':
-			depth++
-		case '}':
-			if depth == 0 {
-				return i
-			}
-			depth--
-		}
-	}
-	return -1
 }
 
 // anyWithin: a span lies inside one of the ranges.

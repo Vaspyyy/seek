@@ -408,6 +408,26 @@ func TestMultilineStrings(t *testing.T) {
 	expect(t, out, "3 def fake():  # an example  (string)", "9 fake text  (string)", "2 function fake() {}  (string)")
 }
 
+// The labels come from Prism's outline.Multiline, which knows more than
+// seek's own classifier did: code in a ${…} that spans lines, strings
+// that span lines in Rust and shell, heredocs, and a Go raw string that
+// ends in a backslash (it ran on and hid the function after it).
+func TestMultilineLabelsFromPrism(t *testing.T) {
+	write := project(t)
+	write("page.ts", "export function page(items) {\n  return `<ul>\n    ${items.map((item) =>\n      needle(item)\n    ).join(\"\")}\n  </ul> needle`;\n}\n")
+	write("lib.rs", "fn usage() -> &'static str {\n    \"usage:\n    needle <file>\"\n}\n")
+	write("run.sh", "usage() {\n\tcat <<EOF\nneedle: run it\nEOF\n\techo 'one\nneedle two'\n}\n")
+	write("win.go", "package p\n\nvar dir = `C:\\`\n\nfunc needle() {}\n")
+	out, _ := seek(t, "needle")
+	expect(t, out,
+		"    4     needle(item)\n", "    6 </ul> needle`;  (string)\n",
+		"    3 needle <file>\"  (string)\n",
+		"    3 needle: run it  (string)\n", "    6 needle two'  (string)\n",
+		"  func needle  L5\n    5 func needle() {}\n",
+	)
+	reject(t, out, "needle(item)  (string)", "func needle() {}  (string)")
+}
+
 // Lock, minified and long-line files stay on one line, with a snippet
 // around a hit when there are only one or two.
 func TestOneLineFiles(t *testing.T) {

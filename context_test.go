@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Vaspyyy/prism/changes"
 	"github.com/Vaspyyy/prism/focus"
 	"github.com/Vaspyyy/prism/repo"
 	"github.com/Vaspyyy/prism/report"
@@ -246,6 +247,73 @@ func TestContextMarksUncommitted(t *testing.T) {
 	if d, _, _ := seekJSON(t, "-l", "List"); d.Context == nil {
 		t.Error("-l --json: no context")
 	}
+}
+
+// toolPy has a "def run():" in its module docstring, then the real run
+// twice (L10, L18).
+const toolPy = `"""Run the tool.
+
+Usage:
+
+    def run():
+        ...
+"""
+
+
+def run():
+    return 1
+
+
+def helper():
+    return 2
+
+
+def run():
+    return 3
+`
+
+// A definition in a docstring isn't one, for seek and for Prism alike:
+// editing the body of the first real run marks run#1, the ref
+// prism/changes gives it. (seek used to drop the docstring's run itself
+// while Prism counted it: Prism's run#2 was seek's run#1, so seek marked
+// the second run instead.)
+func TestDocstringOrdinalsAgreeWithChanges(t *testing.T) {
+	withContext(t)
+	write := project(t)
+	write("tool.py", toolPy)
+	git(t, "init", "-q", "-b", "main")
+	git(t, "add", "-A")
+	git(t, "commit", "-qm", "init")
+	write("tool.py", strings.Replace(toolPy, "    return 1\n", "    return 10\n", 1))
+
+	info, err := repo.Detect(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := changes.Compute(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refs []string
+	for _, s := range set.Symbols {
+		refs = append(refs, s.Ref+" "+strconv.Itoa(s.Line))
+	}
+	wantList(t, "prism/changes", refs, []string{"tool.py:run#1 10"})
+
+	out, _ := seek(t, "run")
+	expect(t, out, "context: 1 changed symbol vs HEAD\n", "  def run#1 [changed]  L10-11\n", "  def run#2  L18-19\n",
+		"     5 def run():  (string)\n")
+	reject(t, out, "run#2 [changed]", "run#3")
+	out, _ = seek(t, "-d", "tool.py:run#1")
+	expect(t, out, "tool.py:run#1 [changed]  L10-11  def run():\n")
+	_, res, _ := seekJSON(t, "run")
+	var marked []string
+	for _, g := range res.Groups {
+		if g.Symbol != nil && g.Symbol.Marks != nil {
+			marked = append(marked, g.Symbol.Ref+" "+strings.Join(g.Symbol.Marks, ","))
+		}
+	}
+	wantList(t, "marked", marked, []string{"tool.py:run#1 changed"})
 }
 
 // Marked definitions come first: in a file, files with them before the
