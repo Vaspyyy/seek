@@ -133,7 +133,7 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 		return 2
 	}
 	if o.list {
-		gs := refFiles(paths, p, ts, m, o.defs)
+		gs, _ := refFiles(paths, p, ts, m, o.defs)
 		listPaths(out, gs, o.null)
 		return exitCode(len(gs) > 0)
 	}
@@ -277,12 +277,12 @@ func namePattern(o options, t ref.Target) (string, search.Options, *search.Patte
 
 // refFiles are the files with hits of the name (-l), in path order; with
 // defs, only those that define it (-l -d).
-func refFiles(paths []string, p *search.Pattern, ts []ref.Target, m []int, defs bool) []*group.File {
+func refFiles(paths []string, p *search.Pattern, ts []ref.Target, m []int, defs bool) ([]*group.File, search.Stats) {
 	defined := map[string]bool{}
 	for _, i := range m {
 		defined[ts[i].Path] = true
 	}
-	found, _ := search.Run(paths, p)
+	found, st := search.Run(paths, p)
 	gs := buildAll(found, p)
 	if defs {
 		var keep []*group.File
@@ -294,7 +294,7 @@ func refFiles(paths []string, p *search.Pattern, ts []ref.Target, m []int, defs 
 		gs = keep
 	}
 	sort.Slice(gs, func(i, j int) bool { return gs[i].Path < gs[j].Path })
-	return gs
+	return gs, st
 }
 
 // refDefs are the definitions a ref names, per file, each as a group with

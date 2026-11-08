@@ -80,6 +80,15 @@ func groupsOf(res report.Seek) []string {
 	return out
 }
 
+// filesOf is the files of -l, which must be there.
+func filesOf(t *testing.T, res report.Seek) []string {
+	t.Helper()
+	if res.Files == nil {
+		t.Fatalf("no files: %+v", res)
+	}
+	return *res.Files
+}
+
 func refsOf(syms []report.Symbol) []string {
 	var out []string
 	for _, s := range syms {
@@ -128,8 +137,11 @@ func TestJSONSearch(t *testing.T) {
 		t.Errorf("result: %+v", res)
 	}
 	wantList(t, "groups", groupsOf(res), []string{"src/lib.cpp src/lib.cpp:parse#1: 1", "src/lib.cpp src/lib.cpp:parse#2: 5 6", "src/lib.cpp src/lib.cpp:use: 10"})
-	if res.Counts != (report.SeekCounts{Hits: 4, Files: 1, Definitions: 2}) {
+	if res.Counts != (report.SeekCounts{Hits: 4, Files: 1, Definitions: 2, Searched: 4}) {
 		t.Errorf("counts %+v", res.Counts)
+	}
+	if res.Query != (report.SeekQuery{WholeWord: true}) || res.Skipped != nil || res.Groups[0].FileKind != "" {
+		t.Errorf("query %+v, skipped %q, file kind %q", res.Query, res.Skipped, res.Groups[0].FileKind)
 	}
 	s := res.Groups[1].Symbol
 	if s.Path != "src/lib.cpp" || s.Name != "parse" || s.Kind != "func" || s.Line != 5 || s.End != 7 || s.Sig != "int parse(int n)" || s.Doc != nil {
@@ -172,7 +184,7 @@ func TestJSONSearch(t *testing.T) {
 
 	// no hits: a result, not an error, and exit 1
 	d, res, code = seekJSON(t, "zzqq")
-	if code != 1 || d.Error != nil || res.Groups == nil || len(res.Groups) != 0 || res.Counts != (report.SeekCounts{}) {
+	if code != 1 || d.Error != nil || res.Groups == nil || len(res.Groups) != 0 || res.Counts != (report.SeekCounts{Searched: 4}) {
 		t.Errorf("no hits: exit %d, %+v, %+v", code, d.Error, res)
 	}
 }
@@ -196,7 +208,7 @@ func TestJSONModes(t *testing.T) {
 	if s := res.Definitions[0]; s.Sig != "int parse(const char* s)" || s.Line != 1 || s.End != 3 || s.Name != "parse" {
 		t.Errorf("-d: %+v", s)
 	}
-	if res.Counts != (report.SeekCounts{Hits: 4, Files: 1, Definitions: 2}) {
+	if res.Counts != (report.SeekCounts{Hits: 4, Files: 1, Definitions: 2, Searched: 4}) {
 		t.Errorf("-d counts %+v", res.Counts)
 	}
 	_, res, _ = seekJSON(t, "-d", "-s", "List")
@@ -214,17 +226,21 @@ func TestJSONModes(t *testing.T) {
 	if code != 0 || len(res.Groups) != 0 {
 		t.Errorf("-l: exit %d, %+v", code, res)
 	}
-	wantList(t, "-l", res.Files, files)
+	wantList(t, "-l", filesOf(t, res), files)
 	if res.Counts.Files != 3 || res.Counts.Hits != 5 {
 		t.Errorf("-l counts %+v", res.Counts)
 	}
 	_, res, _ = seekJSON(t, "-l", "-d", "List")
-	wantList(t, "-l -d", res.Files, []string{"internal/files/files.go"})
+	wantList(t, "-l -d", filesOf(t, res), []string{"internal/files/files.go"})
+	_, res, code = seekJSON(t, "-l", "zzqq")
+	if code != 1 || len(filesOf(t, res)) != 0 {
+		t.Errorf("-l, no hits: exit %d, %q", code, *res.Files)
+	}
 	if err := os.Chdir("internal"); err != nil {
 		t.Fatal(err)
 	}
 	_, res, _ = seekJSON(t, "-l", "List")
-	wantList(t, "-l in a subdirectory", res.Files, files[:1])
+	wantList(t, "-l in a subdirectory", filesOf(t, res), files[:1])
 	_, res, _ = seekJSON(t, "List", "files")
 	wantList(t, "a path in a subdirectory", groupsOf(res), []string{"internal/files/files.go internal/files/files.go:List: 5 7"})
 }
@@ -309,8 +325,11 @@ func TestJSONRef(t *testing.T) {
 		t.Errorf("definition %+v", s)
 	}
 	wantList(t, "groups", groupsOf(res), []string{"main.go main.go:run: 6 7", "notes.txt -: 2"})
-	if res.Counts != (report.SeekCounts{Hits: 3, Files: 2, Definitions: 1}) {
+	if res.Counts != (report.SeekCounts{Hits: 3, Files: 2, Definitions: 1, Searched: 4}) {
 		t.Errorf("counts %+v", res.Counts)
+	}
+	if res.Query != (report.SeekQuery{WholeWord: true, PlainText: true}) {
+		t.Errorf("query %+v", res.Query)
 	}
 
 	_, res, _ = seekJSON(t, "lib.cpp:parse#2")
@@ -329,9 +348,9 @@ func TestJSONRef(t *testing.T) {
 	}
 	wantList(t, "-d", refsOf(res.Definitions), []string{"internal/files/files.go:List"})
 	_, res, _ = seekJSON(t, "-l", "files.go:List")
-	wantList(t, "-l", res.Files, []string{"internal/files/files.go", "main.go", "notes.txt"})
+	wantList(t, "-l", filesOf(t, res), []string{"internal/files/files.go", "main.go", "notes.txt"})
 	_, res, _ = seekJSON(t, "-l", "-d", "files.go:List")
-	wantList(t, "-l -d", res.Files, []string{"internal/files/files.go"})
+	wantList(t, "-l -d", filesOf(t, res), []string{"internal/files/files.go"})
 
 	for _, r := range []string{"main.go:6", "main.go:6:7", "main.go:6-11"} {
 		_, res, code = seekJSON(t, r)
@@ -447,6 +466,9 @@ func TestJSONLimits(t *testing.T) {
 	if res.Counts.Hits != 151 || len(res.Groups) != 2 || len(res.Groups[0].Hits) != 150 || d.Truncated != nil {
 		t.Errorf("no -b: counts %+v, %q, truncated %v", res.Counts, groupsOf(res), d.Truncated)
 	}
+	if res.Groups[1].Path != "min.js" || res.Groups[1].FileKind != "minified" {
+		t.Errorf("file kind %q of %s", res.Groups[1].FileKind, res.Groups[1].Path)
+	}
 	// a minified line is cut around its match
 	h := hitAt(t, res, "min.js", 1)
 	if len(h.Text) > maxText+2*len("…") || !strings.Contains(h.Text, "needle();") || !strings.HasPrefix(h.Text, "…") || !strings.HasSuffix(h.Text, "…") || h.Col != 3011 {
@@ -478,7 +500,71 @@ func TestJSONLimits(t *testing.T) {
 		t.Errorf("-d cap: %q, truncated %v", refsOf(res.Definitions), d.Truncated)
 	}
 	d, res, _ = seekJSON(t, "-l", "needle")
-	if len(res.Files) != 1 || res.Counts.Files != 2 || d.Truncated == nil || *d.Truncated != (report.Truncated{Shown: 1, Total: 2}) {
-		t.Errorf("-l cap: %q, truncated %v", res.Files, d.Truncated)
+	if len(filesOf(t, res)) != 1 || res.Counts.Files != 2 || d.Truncated == nil || *d.Truncated != (report.Truncated{Shown: 1, Total: 2}) {
+		t.Errorf("-l cap: %q, truncated %v", *res.Files, d.Truncated)
 	}
+}
+
+// query says how the pattern was read; skipped is what wasn't searched,
+// also when there are hits; file_kind is the kind the text shows.
+func TestJSONQueryAndSkipped(t *testing.T) {
+	write := refProject(t)
+	write(".gitignore", "build/\n")
+	write("build/out.go", "package build\n\nfunc parse() {}\n")
+	write("bin/a.png", "\x89PNG parse")
+	write("gen.go", "// Code generated by hand. DO NOT EDIT.\n\npackage x\n\nfunc parse() {}\n")
+
+	for _, c := range []struct {
+		args []string
+		want report.SeekQuery
+	}{
+		{[]string{"parse"}, report.SeekQuery{WholeWord: true}},
+		{[]string{"-i", "parse"}, report.SeekQuery{WholeWord: true, IgnoreCase: true}},
+		{[]string{"--partial", "pars"}, report.SeekQuery{}},
+		{[]string{"pars."}, report.SeekQuery{}},
+		{[]string{"-w", "pars."}, report.SeekQuery{WholeWord: true}},
+		{[]string{"-F", "parse("}, report.SeekQuery{PlainText: true}},
+		{[]string{"parse("}, report.SeekQuery{PlainText: true}}, // not a valid regex
+		{[]string{"-i", "lib.cpp:parse#2"}, report.SeekQuery{WholeWord: true, IgnoreCase: true, PlainText: true}},
+	} {
+		if _, res, _ := seekJSON(t, c.args...); res.Query != c.want {
+			t.Errorf("%q: query %+v, want %+v", c.args, res.Query, c.want)
+		}
+	}
+
+	_, res, code := seekJSON(t, "parse")
+	if code != 0 || res.Counts.Searched != 6 {
+		t.Errorf("exit %d, counts %+v", code, res.Counts)
+	}
+	wantList(t, "skipped", res.Skipped, []string{"1 binary file (bin/a.png)", "build/ (ignored by git, caches or dot-folders; -u searches them)"})
+	kinds := map[string]string{}
+	for _, g := range res.Groups {
+		kinds[g.Path] = g.FileKind
+	}
+	if kinds["gen.go"] != "generated" || kinds["src/lib.cpp"] != "" {
+		t.Errorf("file kinds %q", kinds)
+	}
+
+	_, res, _ = seekJSON(t, "-u", "parse")
+	wantList(t, "-u skipped", res.Skipped, []string{"1 binary file (bin/a.png)"})
+	if res.Counts.Searched != 7 || !slices.ContainsFunc(res.Groups, func(g report.SeekGroup) bool { return g.Path == "build/out.go" }) {
+		t.Errorf("-u: counts %+v, %q", res.Counts, groupsOf(res))
+	}
+	_, res, _ = seekJSON(t, "parse", "bin/a.png", "src")
+	wantList(t, "named", res.Skipped, []string{"bin/a.png is binary"})
+	if res.Counts.Searched != 1 {
+		t.Errorf("named: counts %+v", res.Counts)
+	}
+
+	// ref mode: what the search for the name skipped; -l -d
+	_, res, _ = seekJSON(t, "main.go:run")
+	if res.Counts.Searched != 6 || len(res.Skipped) != 2 {
+		t.Errorf("ref: counts %+v, skipped %q", res.Counts, res.Skipped)
+	}
+	write("lone.go", "package x\n\nfunc lonely() {}\n")
+	_, res, code = seekJSON(t, "-l", "-d", "lone.go:lonely")
+	if code != 0 {
+		t.Errorf("ref -l -d: exit %d", code)
+	}
+	wantList(t, "ref -l -d", filesOf(t, res), []string{"lone.go"})
 }

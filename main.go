@@ -157,7 +157,7 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 		gs = definingFiles(o, p, gs)
 	}
 	if o.json {
-		return searchJSON(out, args, o, p, gs, allHits, paths, detected())
+		return searchJSON(out, args, o, p, gs, allHits, paths, st, detected())
 	}
 	if o.list {
 		sort.Slice(gs, func(i, j int) bool { return gs[i].Path < gs[j].Path })
@@ -319,11 +319,21 @@ func listPaths(out *bufio.Writer, gs []*group.File, null bool) {
 // (binary, too big), and, when nothing was found, the binary files, ignored
 // folders and nested repositories that weren't searched.
 func skipped(out *bufio.Writer, o options, st search.Stats, none bool) {
+	for _, note := range notSearched(o, st, none) {
+		fmt.Fprintln(out, "  not searched: "+note)
+	}
+}
+
+// notSearched are the notes of skipped: the named files that weren't
+// searched, and with all the binary files, ignored folders and nested
+// repositories too.
+func notSearched(o options, st search.Stats, all bool) []string {
+	var notes []string
 	named := map[string]bool{}
 	for _, path := range o.paths {
 		if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
 			if _, why := search.Read(path); why != "" {
-				fmt.Fprintf(out, "  not searched: %s is %s\n", shown(path), why)
+				notes = append(notes, fmt.Sprintf("%s is %s", shown(path), why))
 				named[path] = true
 			}
 		}
@@ -334,14 +344,14 @@ func skipped(out *bufio.Writer, o options, st search.Stats, none bool) {
 			binary = append(binary, shown(path))
 		}
 	}
-	if none && len(binary) > 0 {
+	if all && len(binary) > 0 {
 		list := strings.Join(binary[:min(len(binary), 3)], ", ")
 		if len(binary) > 3 {
 			list += fmt.Sprintf(", +%d more", len(binary)-3)
 		}
-		fmt.Fprintf(out, "  not searched: %s (%s)\n", plural(len(binary), "binary file"), list)
+		notes = append(notes, fmt.Sprintf("%s (%s)", plural(len(binary), "binary file"), list))
 	}
-	if none && !o.unrestrict {
+	if all && !o.unrestrict {
 		if sk := files.Skipped(6); len(sk) > 0 {
 			more := ""
 			if len(sk) == 6 {
@@ -350,10 +360,10 @@ func skipped(out *bufio.Writer, o options, st search.Stats, none bool) {
 			for i := range sk {
 				sk[i] = shown(sk[i])
 			}
-			fmt.Fprintf(out, "  not searched: %s%s (ignored by git, caches or dot-folders; -u searches them)\n", strings.Join(sk, ", "), more)
+			notes = append(notes, fmt.Sprintf("%s%s (ignored by git, caches or dot-folders; -u searches them)", strings.Join(sk, ", "), more))
 		}
 	}
-	if n := len(files.Nested); n > 0 && none {
+	if n := len(files.Nested); n > 0 && all {
 		var names []string
 		for _, p := range files.Nested[:min(n, 4)] {
 			names = append(names, shown(p))
@@ -362,8 +372,9 @@ func skipped(out *bufio.Writer, o options, st search.Stats, none bool) {
 		if n > len(names) {
 			more = fmt.Sprintf(" +%d more", n-len(names))
 		}
-		fmt.Fprintf(out, "  not searched: %s inside: %s%s (give it as a path to search it)\n", plural(n, "repository"), strings.Join(names, ", "), more)
+		notes = append(notes, fmt.Sprintf("%s inside: %s%s (give it as a path to search it)", plural(n, "repository"), strings.Join(names, ", "), more))
 	}
+	return notes
 }
 
 // notes end the output with what the budget left out of -s and -C.

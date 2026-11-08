@@ -7,13 +7,17 @@ package main
 //
 // What goes in it:
 //   - groups: the hits per file and containing definition, in the order the
-//     text lists them; symbol is null for hits outside any definition.
+//     text lists them; symbol is null for hits outside any definition, and
+//     file_kind is the kind the text shows ("generated", "vendored", …).
 //   - a hit's text is its line without leading and trailing whitespace (cut
 //     around the first match when it's longer than maxText bytes); col is
 //     the first match's 1-based byte column in the file, like compilers.
 //   - label is seek's label ("definition", "declaration", "assignment",
 //     "import", "comment", "string"), left out for a plain use; writes is
 //     set for the hits --writes keeps.
+//   - query says how the pattern was read, skipped what wasn't searched
+//     (the text's "not searched" notes, always, not only without hits), and
+//     counts.searched how many files were.
 //   - -s, -c and -C change only the text's layout: the JSON lists every hit
 //     either way, and a definition's lines are in its symbol.
 //   - the text's line budget doesn't apply: every hit is listed, up to
@@ -88,18 +92,31 @@ func failJSON(out io.Writer, args []string, info *repo.Info, code, msg string, c
 	return exit
 }
 
-// newSeek is an empty result: the lists that can be empty are [], not null.
-func newSeek(pattern string) report.Seek {
-	return report.Seek{Pattern: pattern, Definitions: []report.Symbol{}, Groups: []report.SeekGroup{}}
+// newSeek is an empty result for a search with p: the lists that can be
+// empty are [], not null.
+func newSeek(pattern string, p *search.Pattern, so search.Options) report.Seek {
+	return report.Seek{Pattern: pattern, Definitions: []report.Symbol{}, Groups: []report.SeekGroup{},
+		Query: report.SeekQuery{WholeWord: p.Smart || so.Words, IgnoreCase: p.Fold, PlainText: p.Text}}
+}
+
+// searched fills in what a search looked at: the files searched, and the
+// notes on what it didn't search.
+func searched(res *report.Seek, o options, st search.Stats) {
+	res.Counts.Searched = st.Files
+	res.Skipped = notSearched(o, st, true)
+	if st.TooBig > 0 {
+		res.Skipped = append(res.Skipped, fmt.Sprintf("%s over %d MB", plural(st.TooBig, "file"), search.MaxSize>>20))
+	}
 }
 
 // searchJSON prints a search's result (seek PATTERN, -d, -l, and -s or -c,
 // which list the same).
-func searchJSON(out io.Writer, args []string, o options, p *search.Pattern, gs []*group.File, allHits int, paths []string, info *repo.Info) int {
+func searchJSON(out io.Writer, args []string, o options, p *search.Pattern, gs []*group.File, allHits int, paths []string, st search.Stats, info *repo.Info) int {
 	env := envelope(args, info)
-	res := newSeek(o.pattern)
+	res := newSeek(o.pattern, p, o.so)
 	hits := countHits(gs)
 	res.Counts = report.SeekCounts{Hits: hits, Files: len(gs), Definitions: countDefs(gs)}
+	searched(&res, o, st)
 	found := len(gs) > 0
 	switch {
 	case o.list:
@@ -197,20 +214,21 @@ func refJSON(out io.Writer, args []string, o options, info *repo.Info, rp refPat
 		}
 		return fail(report.CodeNoMatch, msg, near, 1)
 	}
-	word, _, p, err := namePattern(o, ts[m[0]])
+	word, so, p, err := namePattern(o, ts[m[0]])
 	if err != nil {
 		return fail(report.CodeFailed, err.Error(), nil, 2)
 	}
 
 	env := envelope(args, info)
-	res := newSeek(word)
+	res := newSeek(word, p, so)
 	res.Target = refTarget(r, rp)
 	res.Counts.Definitions = len(m)
 	found := true
 	if o.list {
-		gs := refFiles(paths, p, ts, m, o.defs)
+		gs, st := refFiles(paths, p, ts, m, o.defs)
 		res.Files, env.Truncated = jsonFiles(gs)
 		res.Counts.Hits, res.Counts.Files = countHits(gs), len(gs)
+		searched(&res, o, st)
 		found = len(gs) > 0
 	} else {
 		_, inDefs, whole := refDefs(info, srcs, ts, m, p)
@@ -223,10 +241,11 @@ func refJSON(out io.Writer, args []string, o options, info *repo.Info, rp refPat
 		var cut *report.Truncated
 		res.Definitions, cut = capList(defs, maxItems)
 		if !o.defs { // -d: the definitions only, as the text prints them
-			rest, _ := elsewhere(paths, p, inDefs, o.writes)
+			rest, st := elsewhere(paths, p, inDefs, o.writes)
 			render.Order(rest)
 			res.Groups, env.Truncated = jsonGroups(rest, limit(o))
 			res.Counts.Hits, res.Counts.Files = countHits(rest), len(rest)
+			searched(&res, o, st)
 		}
 		if env.Truncated == nil {
 			env.Truncated = cut
@@ -268,7 +287,7 @@ func jsonGroups(gs []*group.File, n int) ([]report.SeekGroup, *report.Truncated)
 				break
 			}
 			hs := g.Hits[:min(len(g.Hits), n-listed)]
-			sg := report.SeekGroup{Path: path, Symbol: groupSymbol(path, g), Hits: make([]report.SeekHit, len(hs))}
+			sg := report.SeekGroup{Path: path, FileKind: f.Kind, Symbol: groupSymbol(path, g), Hits: make([]report.SeekHit, len(hs))}
 			for i, h := range hs {
 				sg.Hits[i] = jsonHit(h)
 			}
@@ -280,14 +299,16 @@ func jsonGroups(gs []*group.File, n int) ([]report.SeekGroup, *report.Truncated)
 }
 
 // jsonFiles are the paths of -l, from the repository root (the text prints
-// them from the working directory, for the commands it's piped to).
-func jsonFiles(gs []*group.File) ([]string, *report.Truncated) {
+// them from the working directory, for the commands it's piped to). It is
+// never nil: with -l, "files" is there, also when it's empty.
+func jsonFiles(gs []*group.File) (*[]string, *report.Truncated) {
 	files := make([]string, 0, len(gs))
 	for _, f := range gs {
 		files = append(files, shown(f.Path))
 	}
 	sort.Strings(files)
-	return capList(files, maxItems)
+	files, cut := capList(files, maxItems)
+	return &files, cut
 }
 
 func jsonHit(h group.Hit) report.SeekHit {
