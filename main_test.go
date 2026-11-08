@@ -3,10 +3,12 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,9 +19,56 @@ import (
 // repositories have uncommitted files, which context would mark, and a
 // focus or crux run elsewhere mustn't change them. The context tests turn
 // it back on (withContext).
+//
+// With SEEK_TEST_ARGS set, the test binary runs seek with those arguments
+// instead (see seekProcess).
 func TestMain(m *testing.M) {
+	if args, ok := os.LookupEnv("SEEK_TEST_ARGS"); ok {
+		os.Exit(seekMain(strings.Split(args, "\n")))
+	}
 	os.Setenv("PRISM_NO_CONTEXT", "1")
 	os.Exit(m.Run())
+}
+
+// seekMain runs seek as a process of its own, for a test that must be able
+// to kill it. A watchdog ends it if its heap passes 256 MB, so a run that
+// reads without end (a symlink to /dev/zero) fails fast instead of eating
+// the machine's memory.
+func seekMain(args []string) int {
+	go func() {
+		var ms runtime.MemStats
+		for {
+			time.Sleep(10 * time.Millisecond)
+			if runtime.ReadMemStats(&ms); ms.HeapAlloc > 256<<20 {
+				fmt.Fprintln(os.Stderr, "seek: heap over 256 MB")
+				os.Exit(3)
+			}
+		}
+	}()
+	out := bufio.NewWriter(os.Stdout)
+	code := run(args, out, os.Stderr, false)
+	out.Flush()
+	return code
+}
+
+// seekProcess runs seek in a child process, killed after timeout.
+func seekProcess(t *testing.T, timeout time.Duration, args ...string) (string, int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), "SEEK_TEST_ARGS="+strings.Join(args, "\n"))
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("seek %v: still running after %v:\n%s", args, timeout, out)
+	}
+	code := 0
+	if e, ok := err.(*exec.ExitError); ok {
+		code = e.ExitCode()
+	} else if err != nil {
+		t.Fatalf("seek %v: %v", args, err)
+	}
+	return string(out), code
 }
 
 // project makes a temporary folder, changes into it, and returns a

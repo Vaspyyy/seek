@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Vaspyyy/prism/focus"
 	"github.com/Vaspyyy/prism/repo"
@@ -592,4 +593,25 @@ func TestRankAlone(t *testing.T) {
 	if cx.Line() != "" || len(cx.Applied()) != 0 {
 		t.Errorf("already in order: %q %v", cx.Line(), cx.Applied())
 	}
+}
+
+// Loading context never hangs on a file that doesn't end: an untracked
+// symlink to /dev/zero is a changed file, which context outlines.
+func TestContextDevZero(t *testing.T) {
+	write := fixture(t)
+	if err := os.Symlink("/dev/zero", "zero"); err != nil {
+		t.Skip(err)
+	}
+	if err := os.Symlink("/dev/zero", "internal/files/zero.go"); err != nil {
+		t.Fatal(err)
+	}
+	write("main.go", strings.Replace(fxMain, "_ = files.List(nil)", "_ = files.List([]string{})", 1))
+	for _, args := range [][]string{{"List"}, {"internal/files/files.go:List"}, {"-d", "List"}, {"--json", "List"}} {
+		out, code := seekProcess(t, 30*time.Second, args...)
+		if code != 0 || !strings.Contains(out, "List") {
+			t.Errorf("seek %v: exit %d\n%s", args, code, out)
+		}
+	}
+	out, _ := seekProcess(t, 30*time.Second, "List")
+	expect(t, out, "context: 1 changed symbol vs HEAD\n", "  func run [changed]  L5-7\n")
 }
