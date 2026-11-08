@@ -90,6 +90,12 @@ glint, seek, recap and crux name files, symbols and locations the same way, so a
 
 Paths are relative to the repository root. The format is specified in [Prism](https://github.com/Vaspyyy/prism/blob/main/docs/refs.md).
 
+## JSON
+
+`seek --json` prints one JSON document instead of the text, for programs, in every mode (refs, `-d` and `-l` included). It holds every hit, grouped by file and by the definition that contains it (`null` outside any). Each definition has its ref, its lines, its doc comment's lines and its signature. Each hit has its line, the column of its first match, its text (the line without its indentation) and its label. The line budget doesn't apply unless `-b N` is given, which lists at most N hits. Errors are a JSON document on stdout too: a ref that names nothing gives `no_match` with the refs it may have meant, and bad arguments give `usage`. The exit status is the same as without `--json`. The shape is Prism's envelope with a `report.Seek` result, shared with glint, recap and crux, and specified in [Prism](https://github.com/Vaspyyy/prism/blob/main/docs/output.md).
+
+Text stays the default, and it's what agents should read: it's shorter, and it says what it left out.
+
 ## For coding agents
 
 When its output isn't a terminal, seek prints plain text, so an agent can use it directly. To make it the default, add a line like this to the agent's instructions (`AGENTS.md`, `CLAUDE.md` or similar):

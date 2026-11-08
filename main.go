@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Vaspyyy/prism/repo"
+	"github.com/Vaspyyy/prism/report"
 	"github.com/Vaspyyy/seek/internal/files"
 	"github.com/Vaspyyy/seek/internal/group"
 	"github.com/Vaspyyy/seek/internal/render"
@@ -59,6 +60,8 @@ grouped as usual. With -F or -e the pattern is always a pattern.
   -b N        about how many lines to print (default 100, with -s 300; 0: no limit)
   -e PATTERN  a pattern that starts with "-" (or that isn't a ref)
   -A          plain output without colors (the default when not on a terminal)
+  --json      one JSON document instead of the text (Prism's report.Seek):
+              every hit, with no line budget unless -b N is given (N hits)
   --version
 
 Files are what git sees in a repository (tracked and untracked, not
@@ -78,6 +81,7 @@ type options struct {
 	so                         search.Options
 	plain, unrestrict, null    bool
 	writes                     bool
+	json                       bool
 }
 
 func main() {
@@ -93,6 +97,9 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 		if code == 0 {
 			fmt.Fprint(out, msg)
 			return 0
+		}
+		if o.json || jsonFlag(args) { // parse may stop before it reads --json
+			return failJSON(out, args, detect()(), report.CodeUsage, msg, nil, code)
 		}
 		fmt.Fprintln(errw, "seek: "+msg)
 		return code
@@ -111,10 +118,16 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	}
 	paths, err := files.List(roots, files.Options{Globs: o.globs, Unrestrict: o.unrestrict})
 	if err != nil {
+		if o.json {
+			return failJSON(out, args, detected(), report.CodeFailed, err.Error(), nil, 2)
+		}
 		fmt.Fprintln(errw, "seek: "+err.Error())
 		return 2
 	}
 	if isRef {
+		if o.json {
+			return refJSON(out, args, o, info, t, paths)
+		}
 		return refSearch(out, errw, o, info, t, paths, color)
 	}
 	expr := o.pattern
@@ -123,6 +136,9 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	}
 	p, err := search.Compile(expr, o.so)
 	if err != nil {
+		if o.json {
+			return failJSON(out, args, detected(), report.CodeFailed, err.Error(), nil, 2)
+		}
 		fmt.Fprintln(errw, "seek: "+err.Error())
 		return 2
 	}
@@ -139,6 +155,9 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	}
 	if o.list && o.defs {
 		gs = definingFiles(o, p, gs)
+	}
+	if o.json {
+		return searchJSON(out, args, o, p, gs, allHits, paths, st, detected())
 	}
 	if o.list {
 		sort.Slice(gs, func(i, j int) bool { return gs[i].Path < gs[j].Path })
@@ -300,11 +319,21 @@ func listPaths(out *bufio.Writer, gs []*group.File, null bool) {
 // (binary, too big), and, when nothing was found, the binary files, ignored
 // folders and nested repositories that weren't searched.
 func skipped(out *bufio.Writer, o options, st search.Stats, none bool) {
+	for _, note := range notSearched(o, st, none) {
+		fmt.Fprintln(out, "  not searched: "+note)
+	}
+}
+
+// notSearched are the notes of skipped: the named files that weren't
+// searched, and with all the binary files, ignored folders and nested
+// repositories too.
+func notSearched(o options, st search.Stats, all bool) []string {
+	var notes []string
 	named := map[string]bool{}
 	for _, path := range o.paths {
 		if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
 			if _, why := search.Read(path); why != "" {
-				fmt.Fprintf(out, "  not searched: %s is %s\n", shown(path), why)
+				notes = append(notes, fmt.Sprintf("%s is %s", shown(path), why))
 				named[path] = true
 			}
 		}
@@ -315,14 +344,14 @@ func skipped(out *bufio.Writer, o options, st search.Stats, none bool) {
 			binary = append(binary, shown(path))
 		}
 	}
-	if none && len(binary) > 0 {
+	if all && len(binary) > 0 {
 		list := strings.Join(binary[:min(len(binary), 3)], ", ")
 		if len(binary) > 3 {
 			list += fmt.Sprintf(", +%d more", len(binary)-3)
 		}
-		fmt.Fprintf(out, "  not searched: %s (%s)\n", plural(len(binary), "binary file"), list)
+		notes = append(notes, fmt.Sprintf("%s (%s)", plural(len(binary), "binary file"), list))
 	}
-	if none && !o.unrestrict {
+	if all && !o.unrestrict {
 		if sk := files.Skipped(6); len(sk) > 0 {
 			more := ""
 			if len(sk) == 6 {
@@ -331,10 +360,10 @@ func skipped(out *bufio.Writer, o options, st search.Stats, none bool) {
 			for i := range sk {
 				sk[i] = shown(sk[i])
 			}
-			fmt.Fprintf(out, "  not searched: %s%s (ignored by git, caches or dot-folders; -u searches them)\n", strings.Join(sk, ", "), more)
+			notes = append(notes, fmt.Sprintf("%s%s (ignored by git, caches or dot-folders; -u searches them)", strings.Join(sk, ", "), more))
 		}
 	}
-	if n := len(files.Nested); n > 0 && none {
+	if n := len(files.Nested); n > 0 && all {
 		var names []string
 		for _, p := range files.Nested[:min(n, 4)] {
 			names = append(names, shown(p))
@@ -343,8 +372,9 @@ func skipped(out *bufio.Writer, o options, st search.Stats, none bool) {
 		if n > len(names) {
 			more = fmt.Sprintf(" +%d more", n-len(names))
 		}
-		fmt.Fprintf(out, "  not searched: %s inside: %s%s (give it as a path to search it)\n", plural(n, "repository"), strings.Join(names, ", "), more)
+		notes = append(notes, fmt.Sprintf("%s inside: %s%s (give it as a path to search it)", plural(n, "repository"), strings.Join(names, ", "), more))
 	}
+	return notes
 }
 
 // notes end the output with what the budget left out of -s and -C.
@@ -446,11 +476,16 @@ func missed(o options, p *search.Pattern, paths []string, wholeLines int) missed
 }
 
 func (m missedHits) note(pattern string) string {
-	s := fmt.Sprintf("+%s %s (%s)", plural(m.lines, "more hit"), m.what, m.words)
+	s := m.why()
 	if cmd := command(m.flags, pattern); cmd != "" {
 		s += ": " + cmd
 	}
 	return s
+}
+
+// why says what the hits left out are: "+11 more hits in another case (…)".
+func (m missedHits) why() string {
+	return fmt.Sprintf("+%s %s (%s)", plural(m.lines, "more hit"), m.what, m.words)
 }
 
 // command is a seek command line to suggest, or "" if the pattern is too
@@ -495,7 +530,7 @@ func writesOnly(gs []*group.File) []*group.File {
 		for _, g := range f.Groups {
 			var hs []group.Hit
 			for _, h := range g.Hits {
-				if (h.Label == "definition" || h.Label == "declaration" || h.Label == "assignment") && !readsOnly(h) {
+				if setsName(h) {
 					hs = append(hs, h)
 				}
 			}
@@ -510,6 +545,12 @@ func writesOnly(gs []*group.File) []*group.File {
 		}
 	}
 	return out
+}
+
+// setsName: the hit sets the name (a definition, declaration or
+// assignment that isn't only a read).
+func setsName(h group.Hit) bool {
+	return (h.Label == "definition" || h.Label == "declaration" || h.Label == "assignment") && !readsOnly(h)
 }
 
 // getter matches a JavaScript getter's first line, up to its name.
@@ -661,8 +702,9 @@ func defsLine(gs []*group.File, n int, p *search.Pattern, l *render.Layout) stri
 	return strings.Join(parts, ", ")
 }
 
-// definitions prints -d: one line per definition, or with -s each one whole.
-func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.File, scope string, ro render.Options, paths []string, searched string) int {
+// keptDefs are the definitions -d lists, per file, in the order it lists
+// them; total counts them, others the other hits.
+func keptDefs(o options, p *search.Pattern, gs []*group.File) (defFiles []*group.File, total, others int) {
 	want := strings.Split(o.pattern, "|")
 	keep := func(name string) bool {
 		if !p.Smart {
@@ -688,8 +730,6 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 		}
 		return false
 	}
-	var defFiles []*group.File
-	total, others := 0, 0
 	for _, f := range gs {
 		var kept []group.Def
 		for _, d := range f.Defs {
@@ -715,6 +755,12 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 		}
 		return ownDef(a) && !ownDef(b) // the trait or type itself, then its impls
 	})
+	return defFiles, total, others
+}
+
+// definitions prints -d: one line per definition, or with -s each one whole.
+func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.File, scope string, ro render.Options, paths []string, searched string) int {
+	defFiles, total, others := keptDefs(o, p, gs)
 	have := map[string]bool{}
 	for _, f := range defFiles {
 		for _, d := range f.Defs {
@@ -1124,6 +1170,8 @@ func parse(args []string) (options, int, string) {
 			o.so.Partial = true
 		case a == "--writes":
 			o.writes = true
+		case a == "--json":
+			o.json = true
 		case a == "-e":
 			var s string
 			if s, msg = value(&i, "-e"); msg == "" {

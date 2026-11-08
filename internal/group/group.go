@@ -65,7 +65,9 @@ type Def struct {
 	Kind, Name, Sig string
 	Ordinal         int // as in Group
 	Line, End       int
+	Doc             int  // as in Group, for one the outline rules found
 	Outline         bool // found by the outline rules (not only by a keyword on its line)
+	sym             int  // its index in File.Syms, when Outline
 }
 
 // RefName is the name as a ref writes it after the path (see Group).
@@ -174,7 +176,7 @@ func Build(f *search.File, p *search.Pattern) *File {
 		} else if si >= 0 && isDef(out.Syms[si], h, p) {
 			hit.Label = "definition"
 			s := out.Syms[si]
-			out.Defs = append(out.Defs, Def{Kind: s.Kind, Name: g.Name, Ordinal: g.Ordinal, Sig: s.Sig, Line: s.Line, End: s.End, Outline: true})
+			out.Defs = append(out.Defs, Def{Kind: s.Kind, Name: g.Name, Ordinal: g.Ordinal, Sig: s.Sig, Line: s.Line, End: s.End, Outline: true, sym: si})
 		} else {
 			hit.Label = classify(h, st)
 			// a definition by keyword, or a variable declared outside any
@@ -213,6 +215,11 @@ func Build(f *search.File, p *search.Pattern) *File {
 				if d := docStart(lines, g.Line, st, inText); d < g.Line {
 					g.Doc = d
 				}
+			}
+		}
+		for i, d := range out.Defs {
+			if g := byKey[d.sym]; d.Outline && g != nil {
+				out.Defs[i].Doc = g.Doc
 			}
 		}
 	}
