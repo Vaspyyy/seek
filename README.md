@@ -98,7 +98,7 @@ seek knows what you're working on without being told. A definition changed in th
 context: 1 changed symbol vs HEAD; focus: commit b681ef1 (recap, 4 min ago)
 ```
 
-In ref mode, hits in Go, pytest and Rust tests are labelled as such, and `next:` lines at the end give the crux command that runs exactly those tests:
+In ref mode, hits in Go, pytest and Rust tests are labelled as such, and `next:` lines at the end give the crux command that runs those tests. When the command can also run other tests (a test with the same name in another package it lists), the reason says so:
 
 ```
 internal/files/files_test.go  31 lines

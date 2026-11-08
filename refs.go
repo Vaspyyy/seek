@@ -179,10 +179,58 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 	rank(rest, cx)
 	ms := testMentions(rest, word)
 	next := mentionNext(info, ms, word)
-	roDefs.Mark = markFunc(cx)
 
+	// the next: lines and the context: line on top fit the budget by giving
+	// up detail (hit lines, the definition's code), never a file listed
+	// (Prism's docs/output.md, rule 5): the hits' detail first, and with -b,
+	// which bounds the whole output, then the definition's
+	extra := len(next)
+	headMarks := false // the header names up to 3 definitions, with their marks
+	if len(m) <= 3 {
+		for _, i := range m {
+			headMarks = headMarks || len(cx.Peek(refs[i].String())) > 0
+		}
+	}
+	if headMarks || contextLine(cx, defFiles, rest) {
+		extra++
+	}
+	layout, defLines := planDefs(defFiles, roDefs)
+	used := 1 + defLines // the header
+	if rp.shadowed != "" {
+		used++
+	}
+	hitBudget := 100
+	if o.bodies {
+		hitBudget = 300
+	}
+	hitBudget-- // the header, as in a search
+	if o.budgetSet {
+		hitBudget = max(budget-used, 1) // -b bounds the whole output
+	}
+	ro := render.Options{Budget: hitBudget, Color: color, Context: o.context, Bodies: o.bodies, Counts: o.counts, Path: shown,
+		Mark: markFunc(cx), Mentions: word, Extra: extra}
+	var hl *render.Layout
+	hitLines := 0
+	if len(rest) > 0 {
+		hl = render.Plan(rest, ro)
+		hitLines = printedLines(rest, hl, ro)
+	}
+	// with -b, what's over it: the hits' least (a line per file) and the
+	// extra lines the hits had no detail for
+	if over := used + hitLines + extra - budget; o.budgetSet && over > 0 {
+		// the definition shows less code: as many lines fewer, if it has them
+		want := defLines - over
+		for b := roDefs.Budget - over; b >= 1; b-- {
+			ro := roDefs
+			ro.Budget = b
+			l, n := planDefs(defFiles, ro)
+			if layout = l; n <= want {
+				break
+			}
+		}
+	}
+	roDefs.Mark = markFunc(cx)
 	var defsOut bytes.Buffer
-	layout := render.Plan(defFiles, roDefs)
 	render.Print(&defsOut, defFiles, layout, roDefs)
 	reduced, _ := layout.Reduced(defFiles, roDefs)
 
@@ -239,42 +287,46 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 		then += " (searched " + scopeOf(o, st) + ")"
 	}
 	fmt.Fprintf(out, "seek: %s%s%s\n", what, sep, then)
-	used := 1 + bytes.Count(defsOut.Bytes(), []byte{'\n'})
 	if rp.shadowed != "" {
 		fmt.Fprintf(out, "(%s is read from the repository root, not as %s)\n", rp.files[0], rp.shadowed)
-		used++
 	}
 	out.Write(defsOut.Bytes())
 	if reduced > 0 {
-		fmt.Fprintln(out, "(the definition is shortened to fit the budget; raise -b, or -b 0 for no limit)")
-		used++
+		fmt.Fprintln(out, shortened)
 	}
 	if len(rest) == 0 {
 		return 0
 	}
-	// the next: lines, and the context: line on top, come out of the hits'
-	// detail, never out of the files listed
-	extra := len(next)
-	if contextLine(cx, defFiles, rest) {
-		extra++
-	}
-	hitBudget := 100
-	if o.bodies {
-		hitBudget = 300
-	}
-	hitBudget-- // the header, as in a search
-	if o.budgetSet {
-		hitBudget = max(budget-used, 1) // -b bounds the whole output
-	}
-	ro := render.Options{Budget: hitBudget, Color: color, Context: o.context, Bodies: o.bodies, Counts: o.counts, Path: shown,
-		Mark: markFunc(cx), Mentions: word, Extra: extra}
-	hl := render.Plan(rest, ro)
 	render.Print(out, rest, hl, ro)
 	notes(out, hl, rest, ro)
 	for _, l := range report.NextLines(next) {
 		fmt.Fprintln(out, l)
 	}
 	return 0
+}
+
+// shortened is the note under a definition the budget didn't fit whole.
+const shortened = "(the definition is shortened to fit the budget; raise -b, or -b 0 for no limit)"
+
+// planDefs plans how much of the definitions a ref names is shown, and how
+// many lines that takes, the note that it's shortened included.
+func planDefs(defFiles []*group.File, ro render.Options) (*render.Layout, int) {
+	l := render.Plan(defFiles, ro)
+	return l, printedLines(defFiles, l, ro)
+}
+
+// printedLines is how many lines files take as planned, a note that the
+// budget shortened them included. It prints nothing, so it hands out no
+// marks.
+func printedLines(files []*group.File, l *render.Layout, ro render.Options) int {
+	ro.Mark = nil
+	var b bytes.Buffer
+	render.Print(&b, files, l, ro)
+	n := bytes.Count(b.Bytes(), []byte{'\n'})
+	if reduced, _ := l.Reduced(files, ro); reduced > 0 {
+		n++
+	}
+	return n
 }
 
 // readSources reads the files a ref names and lists their definitions as

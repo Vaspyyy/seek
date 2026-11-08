@@ -389,7 +389,7 @@ func listed(out string) (files []string, more int) {
 			if f := strings.Fields(l); len(f) > 1 {
 				more, _ = strconv.Atoi(f[1])
 			}
-		case l == "", l[0] == ' ', strings.HasPrefix(l, "seek: "), strings.HasPrefix(l, "context: "), strings.HasPrefix(l, "next: "), strings.HasPrefix(l, "+"):
+		case l == "", l[0] == ' ', l[0] == '(', l[0] == '+', strings.HasPrefix(l, "seek: "), strings.HasPrefix(l, "context: "), strings.HasPrefix(l, "next: "):
 		default:
 			files = append(files, strings.Fields(l)[0])
 		}
@@ -397,10 +397,38 @@ func listed(out string) (files []string, more int) {
 	return files, more
 }
 
-// Prism's docs/output.md, rule 5: the context: line and next: lines fit in
-// the budget only by giving up detail (hit lines, code), never a file that
+// detail matches the lines a report can give up: hit lines, code.
+var detail = regexp.MustCompile(`(?m)^ +\d+[:\- ]`)
+
+// unbudgeted matches the lines seek prints on top of its budget, with or
+// without context: what didn't fit, what the search left out.
+var unbudgeted = regexp.MustCompile(`(?m)^(… \d+ more |\+\d+ more hits? |\(-[sC]: |\(the definition is shortened)`)
+
+// checkBudget compares a run with and without context against Prism's
+// docs/output.md, rule 5: the context: line and next: lines fit in the
+// budget only by giving up detail (hit lines, code), never a file that
 // would be listed without context; with no detail to give up they go on
 // top. Ranking may move files across the cut, but as many are listed.
+func checkBudget(t *testing.T, b int, ranks bool, args ...string) {
+	t.Helper()
+	args = append([]string{"-b", itoa(b)}, args...)
+	on, _ := seek(t, args...)
+	off, _ := seek(t, append([]string{"--no-context"}, args...)...)
+	if !strings.HasPrefix(on, "context: ") {
+		t.Errorf("seek %v: no context: line\n%s", args, on)
+	}
+	fOn, mOn := listed(on)
+	fOff, mOff := listed(off)
+	if len(fOn) != len(fOff) || mOn != mOff || !ranks && !slices.Equal(fOn, fOff) {
+		t.Errorf("seek %v: lists %d files +%d more, %d +%d without context:\n%s\nwithout:\n%s", args, len(fOn), mOn, len(fOff), mOff, on, off)
+	}
+	n, m := strings.Count(on, "\n"), strings.Count(off, "\n")
+	over := n > m && n > b+len(unbudgeted.FindAllString(on, -1))
+	if n > m+1 || over && detail.MatchString(on) {
+		t.Errorf("seek %v: %d lines, %d without context, over the budget with detail left:\n%s\nwithout:\n%s", args, n, m, on, off)
+	}
+}
+
 func TestContextInBudget(t *testing.T) {
 	write := fixture(t)
 	for i := range 30 {
@@ -408,42 +436,125 @@ func TestContextInBudget(t *testing.T) {
 	}
 	git(t, "add", "-A")
 	git(t, "commit", "-qm", "callers")
-	check := func(ranks bool, args ...string) {
-		t.Helper()
-		on, _ := seek(t, args...)
-		off, _ := seek(t, append([]string{"--no-context"}, args...)...)
-		if !strings.HasPrefix(on, "context: ") {
-			t.Errorf("seek %v: no context: line\n%s", args, on)
-		}
-		fOn, mOn := listed(on)
-		fOff, mOff := listed(off)
-		if len(fOn) != len(fOff) || mOn != mOff || !ranks && !slices.Equal(fOn, fOff) {
-			t.Errorf("seek %v: lists %d files +%d more, %d +%d without context:\n%s\nwithout:\n%s", args, len(fOn), mOn, len(fOff), mOff, on, off)
-		}
-		// on top only when there's no detail to give up: hit lines
-		n, m := strings.Count(on, "\n"), strings.Count(off, "\n")
-		detail := regexp.MustCompile(`(?m)^ +\d+ `).MatchString(off)
-		if n > m+1 || detail && n > m {
-			t.Errorf("seek %v: %d lines, %d without context (detail to give up: %v):\n%s\nwithout:\n%s", args, n, m, detail, on, off)
-		}
-	}
 	budgets := []int{8, 12, 20, 40, 70}
 	// the focus marks List, which comes first anyway: no ranking
 	setFocus(t, "HEAD", "internal/files/files.go:List")
 	for _, b := range budgets {
-		check(false, "-b", itoa(b), "internal/files/files.go:List")
-		check(false, "-b", itoa(b), "List")
-		check(false, "-b", itoa(b), "-s", "List")
+		checkBudget(t, b, false, "internal/files/files.go:List")
+		checkBudget(t, b, false, "List")
+		checkBudget(t, b, false, "-s", "List")
 	}
 	// use3 moves to the front
 	setFocus(t, "HEAD", "internal/files/files.go:List", "pkg/f3.go:use3")
 	for _, b := range budgets {
-		check(true, "-b", itoa(b), "internal/files/files.go:List")
-		check(true, "-b", itoa(b), "List")
-		check(true, "-b", itoa(b), "-c", "List")
-		check(true, "-b", itoa(b), "-s", "List")
-		check(false, "-b", itoa(b), "-d", "use3")
+		checkBudget(t, b, true, "internal/files/files.go:List")
+		checkBudget(t, b, true, "List")
+		checkBudget(t, b, true, "-c", "List")
+		checkBudget(t, b, true, "-s", "List")
+		checkBudget(t, b, false, "-d", "use3")
 	}
+}
+
+// Ref mode with -b: when the hits use all their room for one line per
+// definition, the context: and next: lines come out of the definition's
+// code above them, which -b bounds too.
+func TestContextInBudgetRefDefinition(t *testing.T) {
+	write := fixture(t)
+	var tests strings.Builder
+	tests.WriteString("package files\n\nimport \"testing\"\n")
+	for _, name := range []string{"A", "B", "C", "D"} {
+		tests.WriteString("\nfunc Test" + name + "(t *testing.T) {\n\t_ = List(nil)\n\t_ = List(nil)\n}\n")
+	}
+	write("internal/files/more_test.go", tests.String())
+	git(t, "add", "-A")
+	git(t, "commit", "-qm", "tests")
+	write("internal/files/more_test.go", strings.Replace(tests.String(), "func TestA(t *testing.T) {", "func TestA(t *testing.T) {\n\tt.Parallel()", 1))
+	for b := 8; b <= 24; b++ {
+		checkBudget(t, b, true, "internal/files/files.go:List") // TestA moves its file first
+	}
+	out, _ := seek(t, "-b", "13", "internal/files/files.go:List")
+	if n := strings.Count(out, "\n"); n > 13 {
+		t.Errorf("-b 13: %d lines:\n%s", n, out)
+	}
+	expect(t, out, "context: 1 changed symbol vs HEAD\n", "in 4 tests that mention List: TestA [changed] 2, TestB 2", "next: crux go test")
+}
+
+// -d names a layer in the context: line only for marks it prints: a
+// definition the budget cut, or the list after it, doesn't count.
+func TestContextDefsBudget(t *testing.T) {
+	withContext(t)
+	write := project(t)
+	for _, d := range []string{"a", "b", "c"} {
+		write(d+"/h.go", "package "+d+"\n\nfunc helper() {}\n")
+	}
+	write("d/h.go", "package d\n\nfunc helperTwo() {}\n")
+	git(t, "init", "-q", "-b", "main")
+	git(t, "add", "-A")
+	git(t, "commit", "-qm", "init")
+	write("d/h.go", "package d\n\nfunc helperTwo() { _ = 1 }\n")
+	out, _ := seek(t, "-d", "-b", "2", "helper")
+	expect(t, out, "a/h.go:helper  L3", "… 2 more definitions")
+	reject(t, out, "context:", "[changed]")
+	out, _ = seek(t, "-d", "helper")
+	expect(t, out, "context: 1 changed symbol vs HEAD\n", "definitions whose names contain it: d/h.go:helperTwo [changed]")
+}
+
+// A generated, vendored or lock file is never moved and its one line names
+// no definitions, so a mark there costs no detail and prints nothing.
+func TestContextGeneratedFile(t *testing.T) {
+	withContext(t)
+	write := project(t)
+	write("a.go", "package p\n\nfunc a() {\n\tX()\n\tX()\n\tX()\n}\n")
+	write("gen.go", "// Code generated by hand. DO NOT EDIT.\n\npackage p\n\nfunc g() { X() }\n")
+	git(t, "init", "-q", "-b", "main")
+	git(t, "add", "-A")
+	git(t, "commit", "-qm", "init")
+	write("gen.go", "// Code generated by hand. DO NOT EDIT.\n\npackage p\n\nfunc g() { X(); _ = 1 }\n")
+	for _, b := range []string{"6", "7", "9", "20"} {
+		on, _ := seek(t, "-b", b, "X")
+		off, _ := seek(t, "--no-context", "-b", b, "X")
+		if on != off {
+			t.Errorf("-b %s:\n%s\nwithout context:\n%s", b, on, off)
+		}
+	}
+	out, _ := seek(t, "-b", "9", "X")
+	expect(t, out, "    5 X()\n", "gen.go  5 lines, generated, 1 hit: L5 func g() { X(); _ = 1 }")
+}
+
+// -d -s shows the definitions in the order -d and the JSON list them: the
+// ones context marks first, across files.
+func TestContextDefsOrder(t *testing.T) {
+	withContext(t)
+	write := project(t)
+	write("x/a.go", "package x\n\ntype T struct{}\n\nfunc Open() {}\n\nfunc (T) Open() {}\n")
+	write("y/b.go", "package y\n\nfunc Open() {}\n")
+	git(t, "init", "-q", "-b", "main")
+	git(t, "add", "-A")
+	git(t, "commit", "-qm", "init")
+	write("x/a.go", "package x\n\ntype T struct{}\n\nfunc Open() {}\n\nfunc (T) Open() { _ = 1 }\n")
+	write("y/b.go", "package y\n\nfunc Open() { _ = 1 }\n")
+	want := []string{"x/a.go:T.Open", "y/b.go:Open", "x/a.go:Open"}
+	_, res, _ := seekJSON(t, "-d", "Open")
+	wantList(t, "json", refsOf(res.Definitions), want)
+	out, _ := seek(t, "-d", "Open")
+	var got []string
+	for _, l := range strings.Split(out, "\n") {
+		if f := strings.Fields(l); len(f) > 1 && strings.Contains(f[0], ".go:") {
+			got = append(got, f[0])
+		}
+	}
+	wantList(t, "-d", got, want)
+	out, _ = seek(t, "-d", "-s", "Open")
+	got = nil
+	path := ""
+	for _, l := range strings.Split(out, "\n") {
+		if f := strings.Fields(l); len(f) > 1 && strings.HasSuffix(f[0], ".go") && l[0] != ' ' {
+			path = f[0]
+		} else if strings.HasPrefix(l, "  func ") {
+			got = append(got, path+":"+f[1])
+		}
+	}
+	wantList(t, "-d -s", got, want)
 }
 
 // Ranking records what moved the results even when no mark gets printed:

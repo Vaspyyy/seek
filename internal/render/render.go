@@ -112,7 +112,12 @@ func (o Options) path(p string) string {
 type Layout struct {
 	level []int // per shown file: 1 one line, 2 a line per definition, 3 hit lines, 4 whole definitions
 	ctx   []int // per shown file with -C: the context lines that fit (at most -C)
+	over  int   // the Extra lines that didn't fit: they go on top of the budget
 }
+
+// Over is how many of the Extra lines found no detail to give up and go
+// on top of the budget.
+func (l *Layout) Over() int { return l.over }
 
 // Reduced counts the shown files that didn't get what -s or -C asked for
 // (whole definitions, context lines), of all shown files that could have.
@@ -222,7 +227,10 @@ func Plan(files []*group.File, o Options) *Layout {
 			}
 		}
 	}
-	l := &Layout{level: level}
+	if top < 3 {
+		room -= o.Extra // -c: no detail; only room left over takes them
+	}
+	l := &Layout{level: level, over: max(-room, 0)}
 	if o.Context > 0 {
 		l.ctx = ctx
 	}

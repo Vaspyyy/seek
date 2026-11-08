@@ -795,8 +795,9 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 			}
 		}
 		fmt.Fprintln(out)
-		if c := containing(o, p, paths, have, cx); c != "" {
+		if c, marks := containing(o, p, paths, have, cx); c != "" {
 			fmt.Fprintln(out, "  definitions whose names contain it: "+c)
+			cx.Show(marks...)
 		} else if others == 0 {
 			hints(out, o, p, paths)
 		}
@@ -807,22 +808,25 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 		head += fmt.Sprintf(", %s elsewhere", plural(others, "other hit"))
 	}
 	fmt.Fprintln(out, head)
-	more := containing(o, p, paths, have, cx)
-	if o.bodies {
-		// the definitions context marks first, all still shown
-		rank(defFiles, cx)
-		if contextLine(cx, defFiles) {
-			ro.Extra = 1 // the context: line, out of the code shown
-		}
-		render.Files(out, defFiles, ro)
+	more, moreMarks := containing(o, p, paths, have, cx)
+	printMore := func() {
 		if more != "" {
 			fmt.Fprintln(out, "definitions whose names contain it: "+more)
+			cx.Show(moreMarks...)
 		}
+	}
+	defs := orderedDefs(defFiles, cx) // the ones context marks first, all still shown
+	if o.bodies {
+		if len(defs) > 0 && defs[0].f.Kind == "" && len(cx.Peek(symRefOf(shown(defs[0].f.Path), defs[0].d))) > 0 {
+			ro.Extra = 1 // the context: line, out of the code shown
+		}
+		render.Files(out, defBlocks(defs), ro)
+		printMore()
 		return 0
 	}
 	// one line per definition and no detail to give up: the context: line
 	// goes on top of the budget (Prism's docs/output.md, rule 5)
-	for printed, x := range orderedDefs(defFiles, cx) {
+	for printed, x := range defs {
 		f, d := x.f, x.d
 		if printed >= max(ro.Budget, 1) {
 			fmt.Fprintf(out, "… %s (raise -b)\n", plural(total-printed, "more definition"))
@@ -841,9 +845,7 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 			fmt.Fprintf(out, "%s:%d  %s%s\n", shown(f.Path), d.Line, d.Sig, kind)
 		}
 	}
-	if more != "" {
-		fmt.Fprintln(out, "definitions whose names contain it: "+more)
-	}
+	printMore()
 	return 0
 }
 
@@ -892,20 +894,21 @@ func outlined(f *group.File) bool {
 
 // containing lists definitions whose names contain one of the searched
 // words (load_settings for load), which a whole-word -d leaves out, with
-// their context marks.
-func containing(o options, p *search.Pattern, paths []string, have map[string]bool, cx *work.State) string {
+// their context marks, and those marks, for the caller to Show when it
+// prints the list.
+func containing(o options, p *search.Pattern, paths []string, have map[string]bool, cx *work.State) (string, []string) {
 	if !p.Smart || len(p.Words) > 16 {
-		return ""
+		return "", nil
 	}
 	so := o.so
 	so.Partial = true
 	q, err := search.Compile(defsExpr(o.pattern), so)
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	q.DefMode = true
 	found, _ := search.Run(paths, q)
-	var parts []string
+	var parts, marks []string
 	n := 0
 	for _, g := range buildAll(found, q) {
 		for _, d := range g.Defs {
@@ -922,7 +925,9 @@ func containing(o options, p *search.Pattern, paths []string, have map[string]bo
 			n++
 			if len(parts) < 6 {
 				if d.Outline {
-					parts = append(parts, shown(g.Path)+":"+d.RefName()+work.Suffix(cx.Marks(symRefOf(shown(g.Path), d))))
+					ms := cx.Peek(symRefOf(shown(g.Path), d))
+					marks = append(marks, ms...)
+					parts = append(parts, shown(g.Path)+":"+d.RefName()+work.Suffix(ms))
 				} else {
 					parts = append(parts, fmt.Sprintf("%s:%d (%s)", shown(g.Path), d.Line, name))
 				}
@@ -930,7 +935,7 @@ func containing(o options, p *search.Pattern, paths []string, have map[string]bo
 		}
 	}
 	if n == 0 {
-		return ""
+		return "", nil
 	}
 	if n > len(parts) {
 		parts = append(parts, fmt.Sprintf("+%d more", n-len(parts)))
@@ -939,7 +944,7 @@ func containing(o options, p *search.Pattern, paths []string, have map[string]bo
 	if cmd := command("-d --partial ", o.pattern); cmd != "" {
 		s += ": " + cmd
 	}
-	return s
+	return s, marks
 }
 
 // onlyDefs is f with just the hits that are the given definitions.

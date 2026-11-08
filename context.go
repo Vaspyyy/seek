@@ -117,8 +117,9 @@ func ranked(cx *work.State, why []string) {
 // rank puts what context marks first: in each file the groups whose
 // definition has marks, and files with such groups before the others,
 // stable otherwise. Lock files, generated, minified and vendored code stay
-// at the end. It drops nothing and sets each group's Marked. When the
-// order changed, it records that and why (ranked).
+// at the end and unmarked: their one line names no definitions. It drops
+// nothing and sets each group's Marked. When the order changed, it records
+// that and why (ranked).
 func rank(gs []*group.File, cx *work.State) {
 	if cx == nil || cx.Off {
 		return
@@ -128,7 +129,8 @@ func rank(gs []*group.File, cx *work.State) {
 	for _, f := range gs {
 		path := shown(f.Path)
 		for _, g := range f.Groups {
-			if g.Sym >= 0 {
+			g.Marked = false
+			if g.Sym >= 0 && f.Kind == "" {
 				ms := cx.Peek(groupRef(path, g))
 				g.Marked = len(ms) > 0
 				fileWhy[f] = append(fileWhy[f], ms...)
@@ -138,7 +140,7 @@ func rank(gs []*group.File, cx *work.State) {
 			why = append(why, fileWhy[f]...)
 		}
 	}
-	moved := func(f *group.File) bool { return len(fileWhy[f]) > 0 && f.Kind == "" }
+	moved := func(f *group.File) bool { return len(fileWhy[f]) > 0 }
 	if firstWhere(gs, moved) {
 		for _, f := range gs {
 			if moved(f) {
@@ -203,10 +205,10 @@ func firstWhere[T comparable](s []T, keep func(T) bool) bool {
 	return moved
 }
 
-// contextLine reports whether the text report will likely get a context:
-// line, so the budget can make room for it (out of detail lines, never
-// out of the files listed): context marks something in the result, or
-// says it skipped symbol detail.
+// contextLine reports whether the text report gets a context: line, so the
+// budget can make room for it (out of detail lines, never out of the files
+// listed): a group rank marked (one whose name gets printed, since marked
+// ones come first), or skipped symbol detail.
 func contextLine(cx *work.State, gs ...[]*group.File) bool {
 	if cx == nil || cx.Off {
 		return false
@@ -346,6 +348,27 @@ func symRefOf(path string, d group.Def) string {
 	return ref.Symbol(path, d.Name, d.Ordinal).String()
 }
 
+// defBlocks are the definitions -d -s shows, in their order (orderedDefs),
+// as files: each run of definitions in one file under that file's header.
+// A file whose definitions aren't next to each other in the order gets a
+// header for each run.
+func defBlocks(defs []defAt) []*group.File {
+	var out []*group.File
+	for i := 0; i < len(defs); {
+		j := i + 1
+		for j < len(defs) && defs[j].f == defs[i].f {
+			j++
+		}
+		var ds []group.Def
+		for _, x := range defs[i:j] {
+			ds = append(ds, x.d)
+		}
+		out = append(out, onlyDefs(defs[i].f, ds))
+		i = j
+	}
+	return out
+}
+
 // defAt is a definition -d lists, with its file.
 type defAt struct {
 	f *group.File
@@ -353,7 +376,9 @@ type defAt struct {
 }
 
 // orderedDefs are the definitions -d lists, in order, the ones context
-// marks first (recorded when that changed the order).
+// marks first (recorded when that changed the order). Those in lock files,
+// generated, minified and vendored code stay at the end, as rank keeps
+// them. The text (-d, -d -s) and the JSON list them in this order.
 func orderedDefs(defFiles []*group.File, cx *work.State) []defAt {
 	var all []defAt
 	for _, f := range defFiles {
@@ -369,7 +394,7 @@ func orderedDefs(defFiles []*group.File, cx *work.State) []defAt {
 	var why []string
 	for i, x := range all {
 		idx[i] = i
-		if r := symRefOf(shown(x.f.Path), x.d); r != "" {
+		if r := symRefOf(shown(x.f.Path), x.d); r != "" && x.f.Kind == "" {
 			marks[i] = cx.Peek(r)
 			why = append(why, marks[i]...)
 		}
