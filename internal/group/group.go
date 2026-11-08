@@ -521,14 +521,18 @@ func classify(h search.Hit, st style) string {
 		return ""
 	}
 	trimmed := strings.TrimSpace(h.Text)
+	last := 0
+	for _, sp := range h.Spans {
+		last = max(last, sp[0])
+	}
+	lt := newLineText(h.Text, trimmed, st, last)
 	first := ""
 	for k, sp := range h.Spans {
-		before := h.Text[:sp[0]]
 		l := ""
 		switch {
-		case inComment(before, trimmed, st):
+		case lt.inComment(sp[0]):
 			l = "comment"
-		case inString(before, st):
+		case lt.matches.inString(sp[0]):
 			l = "string"
 		}
 		if l == "" {
@@ -561,71 +565,6 @@ func classifyCode(h search.Hit, sp [2]int, trimmed string, st style) string {
 	return ""
 }
 
-// inString: the text ends inside a string literal. Interpolations
-// (`${x}` in a template, {x} in a Python f-string) are code, and a
-// character literal ('"') opens nothing.
-func inString(before string, st style) bool {
-	var open byte
-	interp := false // the open string interpolates: ` or f"
-	depth := 0      // inside ${…} or {…} of an interpolating string
-	for i := 0; i < len(before); i++ {
-		c := before[i]
-		if depth > 0 {
-			switch c {
-			case '{':
-				depth++
-			case '}':
-				depth--
-			}
-			continue
-		}
-		if c == '\\' {
-			i++
-			continue
-		}
-		if open != 0 {
-			switch {
-			case c == open:
-				open = 0
-			case interp && open == '`' && c == '$' && i+1 < len(before) && before[i+1] == '{':
-				depth, i = 1, i+1
-			case interp && open != '`' && c == '{':
-				if i+1 < len(before) && before[i+1] == '{' {
-					i++ // {{ is a literal brace
-				} else {
-					depth = 1
-				}
-			}
-			continue
-		}
-		if c == '/' && st.js && i+1 < len(before) && before[i+1] != '/' && before[i+1] != '*' && regexStart(before[:i]) {
-			end := regexEnd(before, i)
-			if end < 0 {
-				return true // the match is inside the regex literal
-			}
-			i = end - 1
-			continue
-		}
-		if c == '\'' && strings.IndexByte(st.quotes, '\'') < 0 {
-			// a character literal: 'x', '\n', '"' (Rust lifetimes have no closing quote)
-			if i+2 < len(before) && before[i+2] == '\'' {
-				i += 2
-			} else if i+3 < len(before) && before[i+1] == '\\' && before[i+3] == '\'' {
-				i += 3
-			}
-			continue
-		}
-		if strings.IndexByte(st.quotes, c) >= 0 {
-			if c == '\'' && i > 0 && isWord(before[i-1]) && !fPrefix(before[:i]) {
-				continue // it's, don't
-			}
-			open = c
-			interp = c == '`' || st.fstrings && fPrefix(before[:i])
-		}
-	}
-	return open != 0 && depth == 0
-}
-
 // fPrefix: the string about to open is a Python f-string (f"…", rf'…').
 func fPrefix(s string) bool {
 	n := len(s)
@@ -652,14 +591,41 @@ func isField(s outline.Symbol, h search.Hit, typed bool) string {
 	if !containers[s.Kind] || h.Line == s.Line {
 		return ""
 	}
+	limit := fieldLimit(h.Text, typed)
 	for _, sp := range h.Spans { // in "Sampler sampler;" the second match is the name
 		a, b := widen(h.Text, sp[0], sp[1])
+		if a > limit {
+			continue // the text before it has a byte no field's can have
+		}
 		if typed && typedBefore.MatchString(h.Text[:a]) && typedAfter.MatchString(h.Text[b:]) ||
 			!typed && fieldBefore.MatchString(h.Text[:a]) && fieldAfter.MatchString(h.Text[b:]) {
 			return h.Text[a:b]
 		}
 	}
 	return ""
+}
+
+// fieldLimit is the first byte of text that typedBefore (typed) or
+// fieldBefore can't match: a match after it isn't a field's name, and the
+// regexps needn't read the long text before it, once for every match on a
+// long line.
+func fieldLimit(text string, typed bool) int {
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		switch {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r' || c >= 'a' && c <= 'z':
+		case typed && (isWord(c) || strings.IndexByte(":.<>[]?*&,", c) >= 0):
+		case !typed && c == '(' && i >= 3 && text[i-3:i] == "pub": // pub(crate)
+			j := strings.IndexByte(text[i:], ')')
+			if j < 0 {
+				return len(text)
+			}
+			i += j
+		default:
+			return i
+		}
+	}
+	return len(text)
 }
 
 // widen grows a match to the whole identifier around it (for --partial and
@@ -711,37 +677,6 @@ func bare(t string) string {
 		t = t[:i]
 	}
 	return lastPart(strings.TrimSpace(t))
-}
-
-func inComment(before, trimmed string, st style) bool {
-	for _, m := range st.line {
-		if strings.HasPrefix(trimmed, m) {
-			return true
-		}
-		// a marker earlier on the line, outside a string
-		for i := strings.Index(before, m); i >= 0; {
-			if !inString(before[:i], st) && (m != "#" || i == 0 || before[i-1] == ' ' || before[i-1] == '\t') {
-				return true
-			}
-			j := strings.Index(before[i+len(m):], m)
-			if j < 0 {
-				break
-			}
-			i += len(m) + j
-		}
-	}
-	if st.block {
-		if strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "* ") || trimmed == "*" || strings.HasPrefix(trimmed, "*/") {
-			return true
-		}
-		if i := strings.LastIndex(before, "/*"); i >= 0 && !strings.Contains(before[i:], "*/") && !inString(before[:i], st) {
-			return true
-		}
-	}
-	if st.line == nil && !st.block && strings.Contains(before, "<!--") && !strings.Contains(before, "-->") {
-		return true
-	}
-	return false
 }
 
 func isWord(c byte) bool {

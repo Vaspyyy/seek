@@ -90,9 +90,23 @@ func Order(files []*group.File) {
 }
 
 type writer struct {
-	w io.Writer
-	c palette
-	o Options
+	w     io.Writer
+	c     palette
+	o     Options
+	lines map[*group.File][]string // each file's lines, split once (window asks for them per definition and level)
+}
+
+// fileLines is splitLines(f.Data), split once per file.
+func (w *writer) fileLines(f *group.File) []string {
+	if w.lines == nil {
+		return splitLines(f.Data)
+	}
+	ls, ok := w.lines[f]
+	if !ok {
+		ls = splitLines(f.Data)
+		w.lines[f] = ls
+	}
+	return ls
 }
 
 func (w *writer) line(format string, args ...any) {
@@ -156,7 +170,7 @@ func Files(out io.Writer, files []*group.File, o Options) {
 // Plan decides how much of each file is shown: every file gets a line,
 // then, in order, a line per definition, then the hit lines (or bodies).
 func Plan(files []*group.File, o Options) *Layout {
-	w := &writer{o: o}
+	w := &writer{o: o, lines: map[*group.File][]string{}}
 	room := max(o.Budget, 1)
 	shown := len(files)
 	if shown > room {
@@ -239,7 +253,7 @@ func Plan(files []*group.File, o Options) *Layout {
 
 // Print prints the files as planned.
 func Print(out io.Writer, files []*group.File, l *Layout, o Options) {
-	w := &writer{w: out, c: colors(o.Color), o: o}
+	w := &writer{w: out, c: colors(o.Color), o: o, lines: map[*group.File][]string{}}
 	for i, lv := range l.level {
 		if l.ctx != nil {
 			w.o.Context = l.ctx[i]
@@ -722,14 +736,14 @@ func (w *writer) window(f *group.File, g *group.Group, mode int) []shownLine {
 	if mode == 0 && ctx == 0 {
 		var out []shownLine
 		if g.Sym >= 0 && g.End-g.Line > bigDef {
-			return withOpeners(f, g, splitLines(f.Data))
+			return withOpeners(f, g, w.fileLines(f))
 		}
 		for i := range g.Hits {
 			out = append(out, shownLine{n: g.Hits[i].Line, hit: &g.Hits[i]})
 		}
 		return out
 	}
-	lines := splitLines(f.Data)
+	lines := w.fileLines(f)
 	want := map[int]bool{}
 	first := g.First() // a hit in the doc comment above: start there
 	if mode == 2 {
