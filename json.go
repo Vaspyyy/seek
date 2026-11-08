@@ -23,6 +23,12 @@ package main
 //   - the text's line budget doesn't apply: every hit is listed, up to
 //     maxItems per list. An explicit -b N lists at most N hits (with -d, N
 //     definitions). truncated says when a list was cut.
+//   - context (see context.go) orders the groups and definitions as in the
+//     text, puts its marks in each symbol's marks, and is summed up in
+//     context (null with --no-context).
+//   - in ref mode, links has one "mentions" link (basis "reference") from
+//     each test whose hits name the definition to the definition, and next
+//     the crux commands that run those tests, as the text's next: lines.
 
 import (
 	"fmt"
@@ -35,6 +41,7 @@ import (
 	"github.com/Vaspyyy/prism/ref"
 	"github.com/Vaspyyy/prism/repo"
 	"github.com/Vaspyyy/prism/report"
+	"github.com/Vaspyyy/prism/work"
 	"github.com/Vaspyyy/seek/internal/group"
 	"github.com/Vaspyyy/seek/internal/render"
 	"github.com/Vaspyyy/seek/internal/search"
@@ -84,10 +91,11 @@ func envelope(args []string, info *repo.Info) *report.Envelope {
 }
 
 // failJSON prints an envelope with an error instead of a result and
-// returns exit.
-func failJSON(out io.Writer, args []string, info *repo.Info, code, msg string, cands []string, exit int) int {
+// returns exit. cx is nil when the context isn't known yet.
+func failJSON(out io.Writer, args []string, info *repo.Info, cx *work.State, code, msg string, cands []string, exit int) int {
 	env := envelope(args, info)
 	env.Fail(code, msg, capItems(cands, maxItems)...)
+	env.Context = cx.Context()
 	report.Write(out, env)
 	return exit
 }
@@ -111,8 +119,9 @@ func searched(res *report.Seek, o options, st search.Stats) {
 
 // searchJSON prints a search's result (seek PATTERN, -d, -l, and -s or -c,
 // which list the same).
-func searchJSON(out io.Writer, args []string, o options, p *search.Pattern, gs []*group.File, allHits int, paths []string, st search.Stats, info *repo.Info) int {
-	env := envelope(args, info)
+func searchJSON(out io.Writer, args []string, o options, p *search.Pattern, gs []*group.File, allHits int, paths []string, st search.Stats, bg *background) int {
+	env := envelope(args, bg.info())
+	cx := bg.context()
 	res := newSeek(o.pattern, p, o.so)
 	hits := countHits(gs)
 	res.Counts = report.SeekCounts{Hits: hits, Files: len(gs), Definitions: countDefs(gs)}
@@ -123,18 +132,23 @@ func searchJSON(out io.Writer, args []string, o options, p *search.Pattern, gs [
 		res.Files, env.Truncated = jsonFiles(gs)
 	case o.defs:
 		defFiles, total, _ := keptDefs(o, p, gs)
+		ordered, moved := orderedDefs(defFiles, cx)
+		if moved {
+			cx.Use(work.Rank)
+		}
 		var defs []report.Symbol
-		for _, f := range defFiles {
-			for _, d := range f.Defs {
-				defs = append(defs, defSymbol(shown(f.Path), d))
-			}
+		for _, x := range ordered {
+			defs = append(defs, defSymbol(shown(x.f.Path), x.d, cx))
 		}
 		res.Definitions, env.Truncated = capList(defs, limit(o))
 		res.Counts.Definitions = total
 		found = total > 0
 	default:
 		render.Order(gs)
-		res.Groups, env.Truncated = jsonGroups(gs, limit(o))
+		if rank(gs, cx) {
+			cx.Use(work.Rank)
+		}
+		res.Groups, env.Truncated = jsonGroups(gs, limit(o), cx)
 		found = hits > 0
 		if o.writes {
 			if n := allHits - hits; n > 0 {
@@ -151,6 +165,7 @@ func searchJSON(out io.Writer, args []string, o options, p *search.Pattern, gs [
 		}
 	}
 	env.Result = res
+	env.Context = cx.Context()
 	report.Write(out, env)
 	return exitCode(found)
 }
@@ -159,11 +174,11 @@ func searchJSON(out io.Writer, args []string, o options, p *search.Pattern, gs [
 // hits of the name elsewhere (callers and mentions), as refSearch shows
 // them. A ref that names nothing is an error with the refs it may have
 // meant as candidates.
-func refJSON(out io.Writer, args []string, o options, info *repo.Info, rp refPattern, paths []string) int {
+func refJSON(out io.Writer, args []string, o options, info *repo.Info, rp refPattern, paths []string, bg *background) int {
 	r := rp.r
 	typed := strings.TrimSpace(o.pattern)
 	fail := func(code, msg string, cands []string, exit int) int {
-		return failJSON(out, args, info, code, msg, cands, exit)
+		return failJSON(out, args, info, bg.wait(), code, msg, cands, exit)
 	}
 	if r.Rev != "" {
 		at := r
@@ -224,26 +239,43 @@ func refJSON(out io.Writer, args []string, o options, info *repo.Info, rp refPat
 	res.Target = refTarget(r, rp)
 	res.Counts.Definitions = len(m)
 	found := true
+	var cx *work.State
 	if o.list {
 		gs, st := refFiles(paths, p, ts, m, o.defs)
+		cx = bg.context()
 		res.Files, env.Truncated = jsonFiles(gs)
 		res.Counts.Hits, res.Counts.Files = countHits(gs), len(gs)
 		searched(&res, o, st)
 		found = len(gs) > 0
 	} else {
 		_, inDefs, whole := refDefs(info, srcs, ts, m, p)
+		var rest []*group.File
+		var st search.Stats
+		if !o.defs { // -d: the definitions only, as the text prints them
+			rest, st = elsewhere(paths, p, inDefs, o.writes)
+		}
+		cx = bg.context()
+		refs := ref.Refs(ts)
+		if markedFirst(m, refs, cx) {
+			cx.Use(work.Rank)
+		}
 		var defs []report.Symbol
 		for _, i := range m {
 			if g := whole[i]; g != nil {
-				defs = append(defs, *groupSymbol(ts[i].Path, g))
+				defs = append(defs, *groupSymbol(ts[i].Path, g, cx))
 			}
 		}
 		var cut *report.Truncated
 		res.Definitions, cut = capList(defs, maxItems)
-		if !o.defs { // -d: the definitions only, as the text prints them
-			rest, st := elsewhere(paths, p, inDefs, o.writes)
+		if !o.defs {
 			render.Order(rest)
-			res.Groups, env.Truncated = jsonGroups(rest, limit(o))
+			if rank(rest, cx) {
+				cx.Use(work.Rank)
+			}
+			ms := testMentions(rest, word)
+			env.Links = append(env.Links, mentionLinks(ms, defRefs(refs, m))...)
+			env.Next = append(env.Next, mentionNext(info, ms, word)...)
+			res.Groups, env.Truncated = jsonGroups(rest, limit(o), cx)
 			res.Counts.Hits, res.Counts.Files = countHits(rest), len(rest)
 			searched(&res, o, st)
 		}
@@ -252,6 +284,7 @@ func refJSON(out io.Writer, args []string, o options, info *repo.Info, rp refPat
 		}
 	}
 	env.Result = res
+	env.Context = cx.Context()
 	report.Write(out, env)
 	return exitCode(found)
 }
@@ -277,7 +310,7 @@ func limit(o options) int {
 
 // jsonGroups are the files' groups with at most n hits in all, and what
 // was cut.
-func jsonGroups(gs []*group.File, n int) ([]report.SeekGroup, *report.Truncated) {
+func jsonGroups(gs []*group.File, n int, cx *work.State) ([]report.SeekGroup, *report.Truncated) {
 	out := []report.SeekGroup{}
 	listed, total := 0, countHits(gs)
 	for _, f := range gs {
@@ -287,7 +320,7 @@ func jsonGroups(gs []*group.File, n int) ([]report.SeekGroup, *report.Truncated)
 				break
 			}
 			hs := g.Hits[:min(len(g.Hits), n-listed)]
-			sg := report.SeekGroup{Path: path, FileKind: f.Kind, Symbol: groupSymbol(path, g), Hits: make([]report.SeekHit, len(hs))}
+			sg := report.SeekGroup{Path: path, FileKind: f.Kind, Symbol: groupSymbol(path, g, cx), Hits: make([]report.SeekHit, len(hs))}
 			for i, h := range hs {
 				sg.Hits[i] = jsonHit(h)
 			}
@@ -350,24 +383,26 @@ func hitText(h group.Hit) string {
 	return s
 }
 
-// groupSymbol is the definition containing a group's hits, or nil for the
-// hits outside any.
-func groupSymbol(path string, g *group.Group) *report.Symbol {
+// groupSymbol is the definition containing a group's hits, with its
+// context marks, or nil for the hits outside any.
+func groupSymbol(path string, g *group.Group, cx *work.State) *report.Symbol {
 	if g.Sym < 0 {
 		return nil
 	}
-	return &report.Symbol{Ref: ref.Symbol(path, g.Name, g.Ordinal).String(), Path: path, Name: g.Name, Kind: g.Kind,
-		Line: g.Line, End: g.End, Doc: docLines(g.Doc, g.Line), Sig: g.Sig}
+	r := groupRef(path, g)
+	return &report.Symbol{Ref: r, Path: path, Name: g.Name, Kind: g.Kind,
+		Line: g.Line, End: g.End, Doc: docLines(g.Doc, g.Line), Sig: g.Sig, Marks: cx.Marks(r)}
 }
 
 // defSymbol is a definition -d lists. One the outline rules don't know (a
 // field, a constant, a definition by keyword) has its line as its ref, as
 // the text prints it: tools resolve it to the definition containing it.
-func defSymbol(path string, d group.Def) report.Symbol {
+func defSymbol(path string, d group.Def, cx *work.State) report.Symbol {
 	s := report.Symbol{Path: path, Name: d.Name, Kind: d.Kind, Line: d.Line, End: d.End, Sig: d.Sig}
 	if d.Outline {
-		s.Ref = ref.Symbol(path, d.Name, d.Ordinal).String()
+		s.Ref = symRefOf(path, d)
 		s.Doc = docLines(d.Doc, d.Line)
+		s.Marks = cx.Marks(s.Ref)
 	} else {
 		s.Ref = ref.Location(path, d.Line, 0).String()
 	}

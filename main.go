@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/Vaspyyy/prism/repo"
 	"github.com/Vaspyyy/prism/report"
+	"github.com/Vaspyyy/prism/work"
 	"github.com/Vaspyyy/seek/internal/files"
 	"github.com/Vaspyyy/seek/internal/group"
 	"github.com/Vaspyyy/seek/internal/render"
@@ -62,7 +64,17 @@ grouped as usual. With -F or -e the pattern is always a pattern.
   -A          plain output without colors (the default when not on a terminal)
   --json      one JSON document instead of the text (Prism's report.Seek):
               every hit, with no line budget unless -b N is given (N hits)
+  --no-context  ignore and don't record context; also PRISM_NO_CONTEXT=1
   --version
+
+Context is on by default: definitions changed in the working tree
+[changed] or on this branch [branch], in the commit recap last showed
+[focus] or failing in crux's last run [failing] get that mark after their
+name and come first. Nothing is left out for it. A "context:" line on top
+says what was used.
+
+In ref mode, hits in tests are labelled "(test, mentions NAME)", and a
+"next:" line at the bottom gives the crux command that runs those tests.
 
 Files are what git sees in a repository (tracked and untracked, not
 ignored); elsewhere caches, build output and dot-folders are skipped.
@@ -82,6 +94,7 @@ type options struct {
 	plain, unrestrict, null    bool
 	writes                     bool
 	json                       bool
+	noContext                  bool // --no-context
 }
 
 func main() {
@@ -99,17 +112,40 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 			return 0
 		}
 		if o.json || jsonFlag(args) { // parse may stop before it reads --json
-			return failJSON(out, args, detect()(), report.CodeUsage, msg, nil, code)
+			bg := detect(true)
+			defer bg.wait()
+			return failJSON(out, args, bg.info(), nil, report.CodeUsage, msg, nil, code)
 		}
 		fmt.Fprintln(errw, "seek: "+msg)
 		return code
 	}
-	color := tty && !o.plain && os.Getenv("NO_COLOR") == ""
 	shown = filepath.ToSlash
-	detected := detect()
+	// -l prints paths for other commands: nothing to rank or mark
+	bg := detect(work.Disabled(o.noContext) || o.list && !o.json)
+	defer bg.wait()
+	if o.list || o.json {
+		return runSearch(out, errw, args, o, tty, bg)
+	}
+	// the context: line goes on top, and it names only the marks the report
+	// shows: it comes after the rest is written
+	var body bytes.Buffer
+	w := bufio.NewWriter(&body)
+	code = runSearch(w, errw, args, o, tty, bg)
+	w.Flush()
+	bg.wait()
+	if line := bg.line(); line != "" {
+		fmt.Fprintln(out, line)
+	}
+	out.Write(body.Bytes())
+	return code
+}
+
+// runSearch runs a search and prints its result, as text or JSON.
+func runSearch(out *bufio.Writer, errw io.Writer, args []string, o options, tty bool, bg *background) int {
+	color := tty && !o.plain && os.Getenv("NO_COLOR") == ""
 	var info *repo.Info
 	if refLike(o) {
-		info = detected()
+		info = bg.info()
 	}
 	t, isRef := asRef(o, info)
 	roots := o.paths
@@ -119,16 +155,16 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	paths, err := files.List(roots, files.Options{Globs: o.globs, Unrestrict: o.unrestrict})
 	if err != nil {
 		if o.json {
-			return failJSON(out, args, detected(), report.CodeFailed, err.Error(), nil, 2)
+			return failJSON(out, args, bg.info(), bg.wait(), report.CodeFailed, err.Error(), nil, 2)
 		}
 		fmt.Fprintln(errw, "seek: "+err.Error())
 		return 2
 	}
 	if isRef {
 		if o.json {
-			return refJSON(out, args, o, info, t, paths)
+			return refJSON(out, args, o, info, t, paths, bg)
 		}
-		return refSearch(out, errw, o, info, t, paths, color)
+		return refSearch(out, errw, o, info, t, paths, color, bg)
 	}
 	expr := o.pattern
 	if o.defs {
@@ -137,7 +173,7 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	p, err := search.Compile(expr, o.so)
 	if err != nil {
 		if o.json {
-			return failJSON(out, args, detected(), report.CodeFailed, err.Error(), nil, 2)
+			return failJSON(out, args, bg.info(), bg.wait(), report.CodeFailed, err.Error(), nil, 2)
 		}
 		fmt.Fprintln(errw, "seek: "+err.Error())
 		return 2
@@ -146,7 +182,7 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	searched := p.Expr
 	p.Expr = o.pattern // the header shows what was typed
 	found, st := search.Run(paths, p)
-	detected() // before anything is printed: it sets how paths are shown
+	bg.info() // before anything is printed: it sets how paths are shown
 	gs := buildAll(found, p)
 	allHits := 0 // before --writes
 	if o.writes {
@@ -157,7 +193,7 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 		gs = definingFiles(o, p, gs)
 	}
 	if o.json {
-		return searchJSON(out, args, o, p, gs, allHits, paths, st, detected())
+		return searchJSON(out, args, o, p, gs, allHits, paths, st, bg)
 	}
 	if o.list {
 		sort.Slice(gs, func(i, j int) bool { return gs[i].Path < gs[j].Path })
@@ -174,6 +210,25 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 		return exitCode(len(gs) > 0)
 	}
 	render.Order(gs)
+	scope := scopeOf(o, st)
+	hits := countHits(gs)
+	if !o.defs && hits == 0 && allHits > 0 {
+		fmt.Fprintf(out, "seek: %s in %s: no hits that set it (%s: %s)\n", describe(p), scope, plural(allHits, "other hit"), command("", o.pattern))
+		return 1
+	}
+	if !o.defs && hits == 0 { // nothing for context to rank or mark
+		fmt.Fprintf(out, "seek: %s in %s: no hits\n", describe(p), scope)
+		if d := qualifiedDef(o, p, paths); d != "" {
+			fmt.Fprintf(out, "  defined at %s: %s\n", d, command("-d ", o.pattern))
+		}
+		skipped(out, o, st, true)
+		hints(out, o, p, paths)
+		return 1
+	}
+	cx := bg.context()
+	if !o.defs && rank(gs, cx) { // -d orders its definitions itself
+		cx.Use(work.Rank)
+	}
 	budget := o.budget
 	if o.budgetSet && budget == 0 {
 		budget = 1 << 30 // -b 0: no limit
@@ -184,27 +239,13 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 			budget = 300
 		}
 	}
-	ro := render.Options{Budget: budget - 1, Color: color, Context: o.context, Bodies: o.bodies, Counts: o.counts, Path: shown}
-	scope := scopeOf(o, st)
+	budget-- // the header
+	if !o.defs && contextLine(cx, gs) {
+		budget-- // the context: line
+	}
+	ro := render.Options{Budget: budget, Color: color, Context: o.context, Bodies: o.bodies, Counts: o.counts, Path: shown, Mark: markFunc(cx)}
 	if o.defs {
-		return definitions(out, o, p, gs, scope, ro, paths, searched)
-	}
-	hits := 0
-	for _, f := range gs {
-		hits += f.Count()
-	}
-	if hits == 0 && allHits > 0 {
-		fmt.Fprintf(out, "seek: %s in %s: no hits that set it (%s: %s)\n", describe(p), scope, plural(allHits, "other hit"), command("", o.pattern))
-		return 1
-	}
-	if hits == 0 {
-		fmt.Fprintf(out, "seek: %s in %s: no hits\n", describe(p), scope)
-		if d := qualifiedDef(o, p, paths); d != "" {
-			fmt.Fprintf(out, "  defined at %s: %s\n", d, command("-d ", o.pattern))
-		}
-		skipped(out, o, st, true)
-		hints(out, o, p, paths)
-		return 1
+		return definitions(out, o, p, gs, scope, ro, paths, searched, cx)
 	}
 	count := plural(hits, "hit")
 	if o.writes {
@@ -215,7 +256,7 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 		head = fmt.Sprintf("seek: %s in %s: %s in %s", describe(p), scope, count, plural(len(gs), "file"))
 	}
 	layout := render.Plan(gs, ro)
-	if d := defsLine(gs, 3, p, layout); d != "" {
+	if d := defsLine(gs, 3, p, layout, cx); d != "" {
 		head += "; defined at " + d
 	}
 	fmt.Fprintln(out, head)
@@ -230,32 +271,6 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	notes(out, layout, gs, ro)
 	skipped(out, o, st, false)
 	return 0
-}
-
-// detect finds the repository seek runs in, in the background: that takes
-// a few git commands, which run while seek lists and searches the files.
-// The function it returns waits for the result and sets shown.
-func detect() func() *repo.Info {
-	ch := make(chan *repo.Info, 1)
-	dir, err := os.Getwd()
-	go func() {
-		var in *repo.Info
-		if err == nil {
-			in, _ = repo.Detect(dir)
-		}
-		ch <- in
-	}()
-	var in *repo.Info
-	done := false
-	return func() *repo.Info {
-		if !done {
-			in, done = <-ch, true
-			if in != nil {
-				shown = printedPaths(in)
-			}
-		}
-		return in
-	}
 }
 
 // shown turns a path as seek found it (relative to the working directory,
@@ -678,7 +693,7 @@ func scopeOf(o options, st search.Stats) string {
 
 // defsLine lists where the pattern is defined: "src/a.js:12 (function f)".
 // Only definitions the output doesn't show are listed.
-func defsLine(gs []*group.File, n int, p *search.Pattern, l *render.Layout) string {
+func defsLine(gs []*group.File, n int, p *search.Pattern, l *render.Layout, cx *work.State) string {
 	var parts []string
 	total := 0
 	for i, f := range gs {
@@ -689,6 +704,9 @@ func defsLine(gs []*group.File, n int, p *search.Pattern, l *render.Layout) stri
 			total++
 			if len(parts) < n {
 				s := fmt.Sprintf("%s:%d", shown(f.Path), d.Line)
+				if r := symRefOf(shown(f.Path), d); r != "" {
+					s += work.Suffix(cx.Marks(r))
+				}
 				if len(p.Words) != 1 || lastPart(d.Name) != p.Words[0] {
 					s += " (" + d.Name + ")" // say which, when it isn't plain from the pattern
 				}
@@ -759,7 +777,7 @@ func keptDefs(o options, p *search.Pattern, gs []*group.File) (defFiles []*group
 }
 
 // definitions prints -d: one line per definition, or with -s each one whole.
-func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.File, scope string, ro render.Options, paths []string, searched string) int {
+func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.File, scope string, ro render.Options, paths []string, searched string, cx *work.State) int {
 	defFiles, total, others := keptDefs(o, p, gs)
 	have := map[string]bool{}
 	for _, f := range defFiles {
@@ -777,7 +795,7 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 			}
 		}
 		fmt.Fprintln(out)
-		if c := containing(o, p, paths, have); c != "" {
+		if c := containing(o, p, paths, have, cx); c != "" {
 			fmt.Fprintln(out, "  definitions whose names contain it: "+c)
 		} else if others == 0 {
 			hints(out, o, p, paths)
@@ -789,33 +807,46 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 		head += fmt.Sprintf(", %s elsewhere", plural(others, "other hit"))
 	}
 	fmt.Fprintln(out, head)
-	more := containing(o, p, paths, have)
+	more := containing(o, p, paths, have, cx)
 	if o.bodies {
+		// the definitions context marks first, all still shown
+		if rank(defFiles, cx) {
+			cx.Use(work.Rank)
+		}
+		if contextLine(cx, defFiles) {
+			ro.Budget-- // the context: line
+		}
 		render.Files(out, defFiles, ro)
 		if more != "" {
 			fmt.Fprintln(out, "definitions whose names contain it: "+more)
 		}
 		return 0
 	}
-	printed := 0
-	for _, f := range defFiles {
-		for _, d := range f.Defs {
-			if printed >= max(ro.Budget, 1) {
-				fmt.Fprintf(out, "… %s (raise -b)\n", plural(total-printed, "more definition"))
-				return 0
-			}
-			kind := ""
-			if f.Kind != "" {
-				kind = "  (" + f.Kind + ")"
-			}
-			if d.Outline {
-				fmt.Fprintln(out, defLine(shown(f.Path), d.RefName(), d.Line, d.End, d.Sig)+kind)
-			} else {
-				// a field, a constant, a keyword's name: a line, which other
-				// tools resolve to the definition containing it
-				fmt.Fprintf(out, "%s:%d  %s%s\n", shown(f.Path), d.Line, d.Sig, kind)
-			}
-			printed++
+	defs, moved := orderedDefs(defFiles, cx)
+	if moved {
+		cx.Use(work.Rank)
+	}
+	room := ro.Budget
+	if len(defs) > 0 && marked(cx, symRefOf(shown(defs[0].f.Path), defs[0].d)) {
+		room-- // the context: line (marked definitions come first)
+	}
+	for printed, x := range defs {
+		f, d := x.f, x.d
+		if printed >= max(room, 1) {
+			fmt.Fprintf(out, "… %s (raise -b)\n", plural(total-printed, "more definition"))
+			return 0
+		}
+		kind := ""
+		if f.Kind != "" {
+			kind = "  (" + f.Kind + ")"
+		}
+		if d.Outline {
+			name := d.RefName() + work.Suffix(cx.Marks(symRefOf(shown(f.Path), d)))
+			fmt.Fprintln(out, defLine(shown(f.Path), name, d.Line, d.End, d.Sig)+kind)
+		} else {
+			// a field, a constant, a keyword's name: a line, which other
+			// tools resolve to the definition containing it
+			fmt.Fprintf(out, "%s:%d  %s%s\n", shown(f.Path), d.Line, d.Sig, kind)
 		}
 	}
 	if more != "" {
@@ -824,9 +855,9 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 	return 0
 }
 
-// defLine is a definition as -d prints it: its ref, its lines from the
-// defining one, and its signature:
-// "internal/files/files.go:List  L73-107  func List(roots []string, o Options) ([]string, error)".
+// defLine is a definition as -d prints it: its ref (name may end in its
+// context marks), its lines from the defining one, and its signature:
+// "internal/files/files.go:List [changed]  L73-107  func List(roots []string, o Options) ([]string, error)".
 func defLine(path, name string, line, end int, sig string) string {
 	rng := "L" + strconv.Itoa(line)
 	if end > line {
@@ -868,8 +899,9 @@ func outlined(f *group.File) bool {
 }
 
 // containing lists definitions whose names contain one of the searched
-// words (load_settings for load), which a whole-word -d leaves out.
-func containing(o options, p *search.Pattern, paths []string, have map[string]bool) string {
+// words (load_settings for load), which a whole-word -d leaves out, with
+// their context marks.
+func containing(o options, p *search.Pattern, paths []string, have map[string]bool, cx *work.State) string {
 	if !p.Smart || len(p.Words) > 16 {
 		return ""
 	}
@@ -898,7 +930,7 @@ func containing(o options, p *search.Pattern, paths []string, have map[string]bo
 			n++
 			if len(parts) < 6 {
 				if d.Outline {
-					parts = append(parts, shown(g.Path)+":"+d.RefName())
+					parts = append(parts, shown(g.Path)+":"+d.RefName()+work.Suffix(cx.Marks(symRefOf(shown(g.Path), d))))
 				} else {
 					parts = append(parts, fmt.Sprintf("%s:%d (%s)", shown(g.Path), d.Line, name))
 				}
@@ -1172,6 +1204,8 @@ func parse(args []string) (options, int, string) {
 			o.writes = true
 		case a == "--json":
 			o.json = true
+		case a == "--no-context":
+			o.noContext = true
 		case a == "-e":
 			var s string
 			if s, msg = value(&i, "-e"); msg == "" {

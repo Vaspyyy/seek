@@ -13,6 +13,15 @@ import (
 	"time"
 )
 
+// TestMain turns context off for the tests that compare output: their
+// repositories have uncommitted files, which context would mark, and a
+// focus or crux run elsewhere mustn't change them. The context tests turn
+// it back on (withContext).
+func TestMain(m *testing.M) {
+	os.Setenv("PRISM_NO_CONTEXT", "1")
+	os.Exit(m.Run())
+}
+
 // project makes a temporary folder, changes into it, and returns a
 // function that writes files there.
 func project(t *testing.T) func(name, text string) {

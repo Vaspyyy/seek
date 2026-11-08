@@ -19,6 +19,8 @@ import (
 	"github.com/Vaspyyy/prism/outline"
 	"github.com/Vaspyyy/prism/ref"
 	"github.com/Vaspyyy/prism/repo"
+	"github.com/Vaspyyy/prism/report"
+	"github.com/Vaspyyy/prism/work"
 	"github.com/Vaspyyy/seek/internal/files"
 	"github.com/Vaspyyy/seek/internal/group"
 	"github.com/Vaspyyy/seek/internal/render"
@@ -89,8 +91,10 @@ func refLike(o options) bool {
 // refSearch prints what a ref names: the definition, as -s shows one (doc
 // comment included), then the hits of its name elsewhere, grouped by the
 // definitions that contain them, without the definition itself. A line
-// stands for the innermost definition containing it.
-func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp refPattern, paths []string, color bool) int {
+// stands for the innermost definition containing it. Hits in tests are
+// labelled as tests that mention the name, and next: lines at the end
+// give the crux commands that run those tests.
+func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp refPattern, paths []string, color bool, bg *background) int {
 	r := rp.r
 	typed := strings.TrimSpace(o.pattern)
 	if r.Rev != "" {
@@ -147,6 +151,16 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 	roDefs := render.Options{Budget: budget - 1, Color: color, Bodies: true, Path: shown}
 	refs := ref.Refs(ts)
 	if o.defs {
+		// the definitions context marks first, all still shown
+		cx := bg.context()
+		moved := markedFirst(m, refs, cx)
+		if o.bodies && rank(defFiles, cx) {
+			moved = true
+		}
+		if moved {
+			cx.Use(work.Rank)
+		}
+		roDefs.Mark = markFunc(cx)
 		fmt.Fprintf(out, "seek -d: %s: %s\n", typed, plural(len(m), "definition"))
 		if o.bodies {
 			render.Files(out, defFiles, roDefs)
@@ -154,17 +168,32 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 		}
 		for _, i := range m {
 			t := ts[i]
-			fmt.Fprintln(out, defLine(t.Path, refName(refs[i]), t.Line, t.End, sigOf(defFiles, t)))
+			name := refName(refs[i]) + work.Suffix(cx.Marks(refs[i].String()))
+			fmt.Fprintln(out, defLine(t.Path, name, t.Line, t.End, sigOf(defFiles, t)))
 		}
 		return 0
 	}
+	rest, st := elsewhere(paths, p, inDefs, o.writes)
+	hits := countHits(rest)
+	render.Order(rest)
+	cx := bg.context() // loaded while the search ran
+	moved := markedFirst(m, refs, cx)
+	for _, gs := range [][]*group.File{defFiles, rest} {
+		if rank(gs, cx) {
+			moved = true
+		}
+	}
+	if moved {
+		cx.Use(work.Rank)
+	}
+	ms := testMentions(rest, word)
+	next := mentionNext(info, ms, word)
+	roDefs.Mark = markFunc(cx)
+
 	var defsOut bytes.Buffer
 	layout := render.Plan(defFiles, roDefs)
 	render.Print(&defsOut, defFiles, layout, roDefs)
 	reduced, _ := layout.Reduced(defFiles, roDefs)
-
-	rest, st := elsewhere(paths, p, inDefs, o.writes)
-	hits := countHits(rest)
 
 	describe := func(i int) string {
 		t := ts[i]
@@ -172,16 +201,17 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 		if t.End > t.Line {
 			rng += "-" + strconv.Itoa(t.End)
 		}
-		return fmt.Sprintf("%s (%s, %s)", refs[i], t.Kind, rng)
+		return fmt.Sprintf("%s%s (%s, %s)", refs[i], work.Suffix(cx.Marks(refs[i].String())), t.Kind, rng)
 	}
-	var ds []string
-	for _, i := range m {
-		ds = append(ds, describe(i))
+	what, sep := plural(len(m), "definition"), ", " // more than 3: shown below
+	if len(m) <= 3 {
+		var ds []string
+		for _, i := range m {
+			ds = append(ds, describe(i))
+		}
+		what = strings.Join(ds, ", ")
 	}
-	what, sep := strings.Join(ds, ", "), ", "
-	if len(m) > 3 {
-		what = plural(len(m), "definition") // shown below
-	} else if len(m) > 1 {
+	if len(m) > 1 && len(m) <= 3 {
 		sep = "; " // after a list
 	}
 	switch {
@@ -231,19 +261,27 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 	if len(rest) == 0 {
 		return 0
 	}
+	// the next: lines, and the context: line on top, count against the budget
+	reserve := len(next)
+	if contextLine(cx, defFiles, rest) {
+		reserve++
+	}
 	hitBudget := 100
 	if o.bodies {
 		hitBudget = 300
 	}
-	hitBudget-- // the header, as in a search
+	hitBudget = max(hitBudget-1-reserve, 1) // the header, as in a search
 	if o.budgetSet {
-		hitBudget = max(budget-used, 1) // -b bounds the whole output
+		hitBudget = max(budget-used-reserve, 1) // -b bounds the whole output
 	}
-	ro := render.Options{Budget: hitBudget, Color: color, Context: o.context, Bodies: o.bodies, Counts: o.counts, Path: shown}
-	render.Order(rest)
+	ro := render.Options{Budget: hitBudget, Color: color, Context: o.context, Bodies: o.bodies, Counts: o.counts, Path: shown,
+		Mark: markFunc(cx), Mentions: word}
 	hl := render.Plan(rest, ro)
 	render.Print(out, rest, hl, ro)
 	notes(out, hl, rest, ro)
+	for _, l := range report.NextLines(next) {
+		fmt.Fprintln(out, l)
+	}
 	return 0
 }
 
