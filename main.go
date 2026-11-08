@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -18,6 +19,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/Vaspyyy/prism/repo"
 	"github.com/Vaspyyy/seek/internal/files"
 	"github.com/Vaspyyy/seek/internal/group"
 	"github.com/Vaspyyy/seek/internal/render"
@@ -36,6 +38,11 @@ A pattern is a regular expression (Go syntax). One that is an identifier,
 or several joined by | ("setSpeed", "Repo.Open", "a|b|c"), matches whole
 words only. An invalid regex is searched as plain text.
 
+A pattern that is a ref to a file seek can find ("internal/files/files.go:List",
+"files.go:globSet.match", "main.go:104") shows that definition (for a line:
+the innermost one containing it), then the hits of its name elsewhere,
+grouped as usual. With -F or -e the pattern is always a pattern.
+
   -d          definitions only: where PATTERN is defined, one line each
   -s          show the whole definition around each hit (windows in long ones)
   -c          counts: at most one line per definition
@@ -50,18 +57,20 @@ words only. An invalid regex is searched as plain text.
   -g GLOB     only files matching GLOB ("*.js", "src/**", "!*_test.go"); repeatable
   -u          also ignored files, caches and dot-folders
   -b N        about how many lines to print (default 100, with -s 300; 0: no limit)
-  -e PATTERN  a pattern that starts with "-"
+  -e PATTERN  a pattern that starts with "-" (or that isn't a ref)
   -A          plain output without colors (the default when not on a terminal)
   --version
 
 Files are what git sees in a repository (tracked and untracked, not
 ignored); elsewhere caches, build output and dot-folders are skipped.
+Paths are printed relative to the repository root.
 Exit status: 0 if something matched, 1 if not, 2 on errors.
 `
 
 type options struct {
 	pattern                    string
 	havePattern                bool
+	patternFlag                bool // the pattern came with -e: never a ref
 	paths, globs               []string
 	defs, bodies, counts, list bool
 	context, budget            int
@@ -89,6 +98,25 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 		return code
 	}
 	color := tty && !o.plain && os.Getenv("NO_COLOR") == ""
+	shown = filepath.ToSlash
+	detected := detect()
+	var info *repo.Info
+	if refLike(o) {
+		info = detected()
+	}
+	t, isRef := asRef(o, info)
+	roots := o.paths
+	if isRef && len(roots) == 0 {
+		roots = []string{rootDir(info)} // a ref's callers anywhere in the repository
+	}
+	paths, err := files.List(roots, files.Options{Globs: o.globs, Unrestrict: o.unrestrict})
+	if err != nil {
+		fmt.Fprintln(errw, "seek: "+err.Error())
+		return 2
+	}
+	if isRef {
+		return refSearch(out, errw, o, info, t, paths, color)
+	}
 	expr := o.pattern
 	if o.defs {
 		expr = defsExpr(expr)
@@ -101,12 +129,8 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	p.DefMode = o.defs
 	searched := p.Expr
 	p.Expr = o.pattern // the header shows what was typed
-	paths, err := files.List(o.paths, files.Options{Globs: o.globs, Unrestrict: o.unrestrict})
-	if err != nil {
-		fmt.Fprintln(errw, "seek: "+err.Error())
-		return 2
-	}
 	found, st := search.Run(paths, p)
+	detected() // before anything is printed: it sets how paths are shown
 	gs := buildAll(found, p)
 	allHits := 0 // before --writes
 	if o.writes {
@@ -127,17 +151,7 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 		} else if m := missed(o, p, paths, countHits(gs)); m.lines > 0 && !o.defs {
 			fmt.Fprintln(errw, "seek: "+m.note(o.pattern))
 		}
-		end := "\n"
-		if o.null {
-			end = "\x00"
-		}
-		for _, f := range gs {
-			path := f.Path
-			if strings.HasPrefix(path, "-") {
-				path = "./" + path // not an option to the command it's piped to
-			}
-			fmt.Fprint(out, path+end)
-		}
+		listPaths(out, gs, o.null)
 		return exitCode(len(gs) > 0)
 	}
 	render.Order(gs)
@@ -151,7 +165,7 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 			budget = 300
 		}
 	}
-	ro := render.Options{Budget: budget - 1, Color: color, Context: o.context, Bodies: o.bodies, Counts: o.counts}
+	ro := render.Options{Budget: budget - 1, Color: color, Context: o.context, Bodies: o.bodies, Counts: o.counts, Path: shown}
 	scope := scopeOf(o, st)
 	if o.defs {
 		return definitions(out, o, p, gs, scope, ro, paths, searched)
@@ -199,6 +213,89 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	return 0
 }
 
+// detect finds the repository seek runs in, in the background: that takes
+// a few git commands, which run while seek lists and searches the files.
+// The function it returns waits for the result and sets shown.
+func detect() func() *repo.Info {
+	ch := make(chan *repo.Info, 1)
+	dir, err := os.Getwd()
+	go func() {
+		var in *repo.Info
+		if err == nil {
+			in, _ = repo.Detect(dir)
+		}
+		ch <- in
+	}()
+	var in *repo.Info
+	done := false
+	return func() *repo.Info {
+		if !done {
+			in, done = <-ch, true
+			if in != nil {
+				shown = printedPaths(in)
+			}
+		}
+		return in
+	}
+}
+
+// shown turns a path as seek found it (relative to the working directory,
+// or as given) into the form it prints: relative to the repository root,
+// with forward slashes, also when seek runs in a subdirectory, so that a
+// path or ref seek prints works in every tool. Outside a repository the
+// working directory is the root. Set by run; -l prints paths as found,
+// for the commands they're piped to.
+var shown = filepath.ToSlash
+
+func printedPaths(in *repo.Info) func(string) string {
+	base, ok := in.Rel(".")
+	if !ok {
+		return filepath.ToSlash
+	}
+	var show func(string) string
+	show = func(p string) string {
+		if dir, ok := strings.CutSuffix(p, "/"); ok && dir != "" {
+			return show(dir) + "/" // a folder
+		}
+		if !filepath.IsAbs(p) {
+			if s := path.Join(base, filepath.ToSlash(p)); s != ".." && !strings.HasPrefix(s, "../") {
+				return s
+			}
+		}
+		if r, ok := in.Rel(p); ok {
+			return r
+		}
+		return filepath.ToSlash(p) // outside the repository: as given
+	}
+	return show
+}
+
+// rootDir is the repository's root as a path from the working directory:
+// "." or "../..".
+func rootDir(in *repo.Info) string {
+	base, ok := in.Rel(".")
+	if !ok || base == "." {
+		return "."
+	}
+	return strings.TrimSuffix(strings.Repeat("../", strings.Count(base, "/")+1), "/")
+}
+
+// listPaths prints the paths of files for -l, as they were found (relative
+// to the working directory), for the command they're piped to.
+func listPaths(out *bufio.Writer, gs []*group.File, null bool) {
+	end := "\n"
+	if null {
+		end = "\x00"
+	}
+	for _, f := range gs {
+		path := f.Path
+		if strings.HasPrefix(path, "-") {
+			path = "./" + path // not an option to the command it's piped to
+		}
+		fmt.Fprint(out, path+end)
+	}
+}
+
 // skipped says which files named on the command line weren't searched
 // (binary, too big), and, when nothing was found, the binary files, ignored
 // folders and nested repositories that weren't searched.
@@ -207,7 +304,7 @@ func skipped(out *bufio.Writer, o options, st search.Stats, none bool) {
 	for _, path := range o.paths {
 		if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
 			if _, why := search.Read(path); why != "" {
-				fmt.Fprintf(out, "  not searched: %s is %s\n", path, why)
+				fmt.Fprintf(out, "  not searched: %s is %s\n", shown(path), why)
 				named[path] = true
 			}
 		}
@@ -215,7 +312,7 @@ func skipped(out *bufio.Writer, o options, st search.Stats, none bool) {
 	var binary []string
 	for _, path := range st.BinaryPaths {
 		if !named[path] {
-			binary = append(binary, path)
+			binary = append(binary, shown(path))
 		}
 	}
 	if none && len(binary) > 0 {
@@ -231,11 +328,17 @@ func skipped(out *bufio.Writer, o options, st search.Stats, none bool) {
 			if len(sk) == 6 {
 				sk, more = sk[:5], ", …"
 			}
+			for i := range sk {
+				sk[i] = shown(sk[i])
+			}
 			fmt.Fprintf(out, "  not searched: %s%s (ignored by git, caches or dot-folders; -u searches them)\n", strings.Join(sk, ", "), more)
 		}
 	}
 	if n := len(files.Nested); n > 0 && none {
-		names := files.Nested[:min(n, 4)]
+		var names []string
+		for _, p := range files.Nested[:min(n, 4)] {
+			names = append(names, shown(p))
+		}
 		more := ""
 		if n > len(names) {
 			more = fmt.Sprintf(" +%d more", n-len(names))
@@ -510,13 +613,17 @@ func describe(p *search.Pattern) string {
 func scopeOf(o options, st search.Stats) string {
 	if len(o.paths) == 1 && len(o.globs) == 0 && st.Files <= 1 {
 		if fi, err := os.Stat(o.paths[0]); err == nil && !fi.IsDir() {
-			return o.paths[0]
+			return shown(o.paths[0])
 		}
 	}
 	n := plural(st.Files, "file")
 	where := ""
 	if len(o.paths) > 0 {
-		where = strings.Join(o.paths, " ") + ", "
+		var ps []string
+		for _, p := range o.paths {
+			ps = append(ps, shown(p))
+		}
+		where = strings.Join(ps, " ") + ", "
 	}
 	if len(o.globs) > 0 {
 		n = fmt.Sprintf("%s matching %s", plural(st.Files, "file"), strings.Join(o.globs, " "))
@@ -540,7 +647,7 @@ func defsLine(gs []*group.File, n int, p *search.Pattern, l *render.Layout) stri
 		for _, d := range f.Defs {
 			total++
 			if len(parts) < n {
-				s := fmt.Sprintf("%s:%d", f.Path, d.Line)
+				s := fmt.Sprintf("%s:%d", shown(f.Path), d.Line)
 				if len(p.Words) != 1 || lastPart(d.Name) != p.Words[0] {
 					s += " (" + d.Name + ")" // say which, when it isn't plain from the pattern
 				}
@@ -644,33 +751,42 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 		}
 		return 0
 	}
-	shown := 0
+	printed := 0
 	for _, f := range defFiles {
 		for _, d := range f.Defs {
-			if shown >= max(ro.Budget, 1) {
-				fmt.Fprintf(out, "… %s (raise -b)\n", plural(total-shown, "more definition"))
+			if printed >= max(ro.Budget, 1) {
+				fmt.Fprintf(out, "… %s (raise -b)\n", plural(total-printed, "more definition"))
 				return 0
-			}
-			first := d.Line
-			if d.First > 0 && d.First < first {
-				first = d.First // the range starts at the doc comment, as in the other views
-			}
-			rng := strconv.Itoa(first)
-			if d.End > first {
-				rng += "-" + strconv.Itoa(d.End)
 			}
 			kind := ""
 			if f.Kind != "" {
 				kind = "  (" + f.Kind + ")"
 			}
-			fmt.Fprintf(out, "%s:%s  %s%s\n", f.Path, rng, d.Sig, kind)
-			shown++
+			if d.Outline {
+				fmt.Fprintln(out, defLine(shown(f.Path), d.RefName(), d.Line, d.End, d.Sig)+kind)
+			} else {
+				// a field, a constant, a keyword's name: a line, which other
+				// tools resolve to the definition containing it
+				fmt.Fprintf(out, "%s:%d  %s%s\n", shown(f.Path), d.Line, d.Sig, kind)
+			}
+			printed++
 		}
 	}
 	if more != "" {
 		fmt.Fprintln(out, "definitions whose names contain it: "+more)
 	}
 	return 0
+}
+
+// defLine is a definition as -d prints it: its ref, its lines from the
+// defining one, and its signature:
+// "internal/files/files.go:List  L73-107  func List(roots []string, o Options) ([]string, error)".
+func defLine(path, name string, line, end int, sig string) string {
+	rng := "L" + strconv.Itoa(line)
+	if end > line {
+		rng += "-" + strconv.Itoa(end)
+	}
+	return path + ":" + name + "  " + rng + "  " + sig
 }
 
 // keepName: name (possibly qualified, possibly with generics) is one of want.
@@ -735,7 +851,11 @@ func containing(o options, p *search.Pattern, paths []string, have map[string]bo
 			}
 			n++
 			if len(parts) < 6 {
-				parts = append(parts, fmt.Sprintf("%s (%s:%d)", name, g.Path, d.Line))
+				if d.Outline {
+					parts = append(parts, shown(g.Path)+":"+d.RefName())
+				} else {
+					parts = append(parts, fmt.Sprintf("%s:%d (%s)", shown(g.Path), d.Line, name))
+				}
 			}
 		}
 	}
@@ -850,11 +970,11 @@ func hints(out *bufio.Writer, o options, p *search.Pattern, paths []string) {
 	fmt.Fprintln(out, "  similar names:")
 	for _, c := range keep {
 		n := c.n
-		where := fmt.Sprintf("%s:%d", n.Paths[0], n.Line)
+		where := fmt.Sprintf("%s:%d", shown(n.Paths[0]), n.Line)
 		if c.def != "" {
 			where = "defined at " + c.def
 		} else if len(n.Paths) > 1 {
-			where = fmt.Sprintf("in %s, e.g. %s:%d", plural(len(n.Paths), "file"), n.Paths[0], n.Line)
+			where = fmt.Sprintf("in %s, e.g. %s:%d", plural(len(n.Paths), "file"), shown(n.Paths[0]), n.Line)
 		}
 		fmt.Fprintf(out, "    %s  %s, %s\n", clipWord(n.Word), plural(n.Count, "hit"), where)
 	}
@@ -898,7 +1018,7 @@ func firstDef(word string, paths []string) string {
 		g := group.Build(f, p)
 		for _, d := range g.Defs {
 			if lastPart(d.Name) == word {
-				return fmt.Sprintf("%s:%d (%s)", f.Path, d.Line, d.Kind)
+				return fmt.Sprintf("%s:%d (%s)", shown(f.Path), d.Line, d.Kind)
 			}
 		}
 	}
@@ -923,7 +1043,7 @@ func qualifiedDef(o options, p *search.Pattern, paths []string) string {
 	for _, f := range found {
 		for _, d := range group.Build(f, q).Defs {
 			if d.Name == name || strings.HasSuffix(d.Name, "."+name) {
-				return fmt.Sprintf("%s:%d (%s)", f.Path, d.Line, d.Kind)
+				return fmt.Sprintf("%s:%d (%s)", shown(f.Path), d.Line, d.Kind)
 			}
 		}
 	}
@@ -1009,6 +1129,7 @@ func parse(args []string) (options, int, string) {
 			if s, msg = value(&i, "-e"); msg == "" {
 				msg = setPattern(s)
 			}
+			o.patternFlag = true
 		case a == "-C" || a == "-b" || a == "-g":
 			var s string
 			if s, msg = value(&i, a); msg == "" {
@@ -1049,6 +1170,7 @@ func parse(args []string) (options, int, string) {
 					}
 					if c == 'e' {
 						msg = setPattern(v)
+						o.patternFlag = true
 					} else {
 						msg = o.setValue(c, v, number)
 					}

@@ -23,6 +23,9 @@ type Options struct {
 	Context int  // lines of context around each hit (-C)
 	Bodies  bool // whole definitions (-s)
 	Counts  bool // at most one line per definition (-c)
+	// Path turns a file's path into the one printed (repo-relative); nil
+	// prints it as it is
+	Path func(string) string
 }
 
 type palette struct{ bold, faint, path, sym, match, label, reset string }
@@ -81,6 +84,15 @@ type writer struct {
 
 func (w *writer) line(format string, args ...any) {
 	fmt.Fprintf(w.w, format+"\n", args...)
+}
+
+func (w *writer) path(f *group.File) string { return w.o.path(f.Path) }
+
+func (o Options) path(p string) string {
+	if o.Path == nil {
+		return p
+	}
+	return o.Path(p)
 }
 
 // Layout is how much of each file fits the budget.
@@ -217,7 +229,7 @@ func Print(out io.Writer, files []*group.File, l *Layout, o Options) {
 		for _, f := range files[shown:] {
 			hits += f.Count()
 			if len(names) < 5 {
-				names = append(names, f.Path)
+				names = append(names, w.path(f))
 			}
 		}
 		more := ""
@@ -225,6 +237,25 @@ func Print(out io.Writer, files []*group.File, l *Layout, o Options) {
 			more = fmt.Sprintf(", +%d more", n-len(names))
 		}
 		w.line("%s… %s with %s: %s%s (raise -b, or narrow with -g or a path)%s", w.c.faint, plural(n, "more file"), plural(hits, "hit"), strings.Join(names, ", "), more, w.c.reset)
+	}
+}
+
+// Excerpt prints line n of a file with ctx lines around it, under the
+// file's header, the way -C shows a hit: for a location that no
+// definition contains.
+func Excerpt(out io.Writer, path string, data []byte, n, ctx int, o Options) {
+	w := &writer{w: out, c: colors(o.Color), o: o}
+	lines := splitLines(data)
+	c := w.c
+	w.line("%s%s%s  %s", c.path, o.path(path), c.reset, plural(search.CountLines(data), "line"))
+	last := min(n+ctx, len(lines))
+	width := len(strconv.Itoa(last))
+	for k := max(n-ctx, 1); k <= last; k++ {
+		ch := '-'
+		if k == n {
+			ch = ':'
+		}
+		w.line("%s", strings.TrimRight(fmt.Sprintf("  %s%*d%c%s %s", c.faint, width, k, ch, c.reset, clipLine(lines[k-1], 300)), " "))
 	}
 }
 
@@ -272,7 +303,7 @@ func (w *writer) file(f *group.File, lv int) {
 		hits += " (" + labels + ")"
 	}
 	desc = append(desc, hits)
-	head := fmt.Sprintf("%s%s%s  %s", c.path, f.Path, c.reset, strings.Join(desc, ", "))
+	head := fmt.Sprintf("%s%s%s  %s", c.path, w.path(f), c.reset, strings.Join(desc, ", "))
 	switch {
 	case lv == 1 && f.Kind != "":
 		var ls []string
@@ -303,7 +334,7 @@ func (w *writer) file(f *group.File, lv int) {
 		return
 	}
 	// the hit lines follow: they show the labels themselves
-	w.line("%s%s%s  %s%s", c.path, f.Path, c.reset, plural(f.Lines, "line"), crlf(f))
+	w.line("%s%s%s  %s%s", c.path, w.path(f), c.reset, plural(f.Lines, "line"), crlf(f))
 	width := len(strconv.Itoa(lastLine(f)))
 	for _, g := range f.Groups {
 		ind := "  "
@@ -410,11 +441,13 @@ func (w *writer) groupHead(g *group.Group) string {
 	if g.Sym < 0 {
 		return c.faint + "(top level)" + c.reset
 	}
-	rng := "L" + strconv.Itoa(g.First())
-	if g.End > g.First() {
+	// from the defining line, as compilers and editors report it; the
+	// header's path, ":" and the name make the definition's ref
+	rng := "L" + strconv.Itoa(g.Line)
+	if g.End > g.Line {
 		rng += "-" + strconv.Itoa(g.End)
 	}
-	return fmt.Sprintf("%s %s%s%s  %s", g.Kind, c.sym, g.Name, c.reset, rng)
+	return fmt.Sprintf("%s %s%s%s  %s", g.Kind, c.sym, g.RefName(), c.reset, rng)
 }
 
 // groupCount is a definition's hits on one line: "14 hits (1 assignment): L11678, L11687, …".
@@ -467,7 +500,7 @@ func (w *writer) topGroups(f *group.File, n int) string {
 	sort.SliceStable(gs, func(i, j int) bool { return len(gs[i].Hits) > len(gs[j].Hits) })
 	var parts []string
 	for _, g := range gs[:min(n, len(gs))] {
-		name := g.Name
+		name := g.RefName()
 		if g.Sym < 0 {
 			name = "(top level)"
 		}
