@@ -264,6 +264,29 @@ func Print(out io.Writer, files []*group.File, l *Layout, o Options) {
 	}
 }
 
+// Marks hands out the marks of the names Print prints (o.Mark), without
+// printing: for a caller that writes the context: line, which names only
+// marks the report shows, before the files.
+func Marks(files []*group.File, l *Layout, o Options) {
+	if o.Mark == nil {
+		return
+	}
+	w := &writer{o: o}
+	for i, lv := range l.level {
+		f := files[i]
+		switch lv = max(lv, 1); {
+		case lv == 1 && f.Kind != "": // its hits' lines, no names
+		case lv == 1 && f.Outlined && len(f.Groups) > 0:
+			w.topGroups(f, 4)
+		case lv == 1 || lv == 2 && !f.Outlined: // line numbers only
+		default:
+			for _, g := range f.Groups {
+				w.marks(f, g)
+			}
+		}
+	}
+}
+
 // Excerpt prints line n of a file with ctx lines around it, under the
 // file's header, the way -C shows a hit: for a location that no
 // definition contains.

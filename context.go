@@ -13,8 +13,10 @@ package main
 // itself, not from context, so --no-context keeps it.
 
 import (
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/Vaspyyy/prism/evidence"
 	"github.com/Vaspyyy/prism/ref"
@@ -91,6 +93,28 @@ func (b *background) line() string {
 		return ""
 	}
 	return b.cx.Line()
+}
+
+// lineFirst writes the context: line before the report's first byte. The
+// report streams through it as before: each way of printing hands out the
+// marks it will print (render.Marks, Show) before it writes anything, so
+// the line is the same as one made after the whole report.
+type lineFirst struct {
+	w       io.Writer
+	line    func() string
+	started bool
+}
+
+func (l *lineFirst) Write(p []byte) (int, error) {
+	if !l.started {
+		l.started = true
+		if s := l.line(); s != "" {
+			if _, err := io.WriteString(l.w, s+"\n"); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return l.w.Write(p)
 }
 
 // markFunc is render.Options.Mark: the marks of a printed definition.
@@ -360,11 +384,56 @@ func defBlocks(defs []defAt) []*group.File {
 			j++
 		}
 		var ds []group.Def
-		for _, x := range defs[i:j] {
+		at := map[int]int{} // a definition's line: its place in the order
+		for k, x := range defs[i:j] {
 			ds = append(ds, x.d)
+			if _, ok := at[x.d.Line]; !ok {
+				at[x.d.Line] = k
+			}
 		}
-		out = append(out, onlyDefs(defs[i].f, ds))
+		b := onlyDefs(defs[i].f, ds)
+		first := func(g *group.Group) int {
+			n := len(ds)
+			for _, h := range g.Hits {
+				if k, ok := at[h.Line]; ok {
+					n = min(n, k)
+				}
+			}
+			return n
+		}
+		slices.SortStableFunc(b.Groups, func(x, y *group.Group) int { return first(x) - first(y) })
+		out = append(out, b)
 		i = j
+	}
+	return out
+}
+
+// refBlocks are the definitions a ref names as files to show, in the order
+// of m (the ones context marks first, as the header and the JSON list
+// them): each run of definitions in one file under that file's header.
+func refBlocks(defFiles []*group.File, whole map[int]*group.Group, ts []ref.Target, m []int, refs []ref.Ref, cx *work.State) []*group.File {
+	byPath := map[string]*group.File{}
+	for _, f := range defFiles {
+		byPath[shown(f.Path)] = f
+	}
+	var out []*group.File
+	for k := 0; k < len(m); {
+		path := ts[m[k]].Path
+		var b *group.File
+		if f := byPath[path]; f != nil {
+			c := *f
+			c.Groups = nil
+			b = &c
+		}
+		for ; k < len(m) && ts[m[k]].Path == path; k++ {
+			if g := whole[m[k]]; b != nil && g != nil {
+				g.Marked = b.Kind == "" && len(cx.Peek(refs[m[k]].String())) > 0
+				b.Groups = append(b.Groups, g)
+			}
+		}
+		if b != nil && len(b.Groups) > 0 {
+			out = append(out, b)
+		}
 	}
 	return out
 }

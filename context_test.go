@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -556,6 +558,86 @@ func TestContextDefsOrder(t *testing.T) {
 		}
 	}
 	wantList(t, "-d -s", got, want)
+
+	// within one file too: T.Open comes before Open in x/a.go
+	git(t, "checkout", "-q", "y/b.go")
+	want = []string{"x/a.go:T.Open", "x/a.go:Open", "y/b.go:Open"}
+	_, res, _ = seekJSON(t, "-d", "Open")
+	wantList(t, "json, one file", refsOf(res.Definitions), want)
+	out, _ = seek(t, "-d", "Open")
+	got = nil
+	for _, l := range strings.Split(out, "\n") {
+		if f := strings.Fields(l); len(f) > 1 && strings.Contains(f[0], ".go:") {
+			got = append(got, f[0])
+		}
+	}
+	wantList(t, "-d, one file", got, want)
+	out, _ = seek(t, "-d", "-s", "Open")
+	got = nil
+	for _, l := range strings.Split(out, "\n") {
+		if f := strings.Fields(l); len(f) > 1 && strings.HasSuffix(f[0], ".go") && l[0] != ' ' {
+			path = f[0]
+		} else if strings.HasPrefix(l, "  func ") {
+			got = append(got, path+":"+f[1])
+		}
+	}
+	wantList(t, "-d -s, one file", got, want)
+	out, _ = seek(t, "x/a.go:Open")
+	expect(t, out, "seek: x/a.go:Open (func, L5)")
+}
+
+// chunks records how a report reaches its writer.
+type chunks struct {
+	bytes.Buffer
+	writes, biggest int
+}
+
+func (c *chunks) Write(p []byte) (int, error) {
+	c.writes++
+	c.biggest = max(c.biggest, len(p))
+	return c.Buffer.Write(p)
+}
+
+// The text report streams: the context: line goes before the first byte,
+// and it names every layer whose marks the report prints, also those only
+// printed after the first 64 KB have gone out.
+func TestContextStreams(t *testing.T) {
+	write := fixture(t)
+	write("b.go", "package main\n\nfunc small() { X() }\n")
+	git(t, "add", "-A")
+	git(t, "commit", "-qm", "small")
+	short := setFocus(t, "HEAD", "b.go:small")
+	var big strings.Builder
+	big.WriteString("package main\n\nfunc big() {\n")
+	for range 5000 {
+		big.WriteString("\tX() // a line long enough to fill the output\n")
+	}
+	big.WriteString("}\n")
+	write("a.go", big.String())
+
+	var c chunks
+	var e bytes.Buffer
+	w := bufio.NewWriterSize(&c, 4096)
+	run([]string{"-b", "0", "X"}, w, &e, false)
+	w.Flush()
+	out := c.String()
+	if c.Len() < 200<<10 {
+		t.Fatalf("the report is too short to test streaming: %d bytes", c.Len())
+	}
+	wantLine := "context: 1 changed symbol vs HEAD; focus: commit " + short + " (recap, just now)\n"
+	if !strings.HasPrefix(out, wantLine) {
+		t.Errorf("first line %q, want %q", out[:strings.IndexByte(out, '\n')+1], wantLine)
+	}
+	if strings.Index(out, "func small [focus]") < 64<<10 {
+		t.Errorf("the focus mark comes too early to test the line")
+	}
+	if c.biggest > 64<<10+4096 || c.writes < 3 {
+		t.Errorf("not streamed: %d writes, the biggest %d bytes", c.writes, c.biggest)
+	}
+	// the same as with a budget that doesn't bind
+	if same, _ := seek(t, "-b", "1000000", "X"); same != out {
+		t.Errorf("-b 0 and -b 1000000 differ")
+	}
 }
 
 // Ranking records what moved the results even when no mark gets printed:

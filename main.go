@@ -5,7 +5,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -126,17 +125,10 @@ func run(args []string, out *bufio.Writer, errw io.Writer, tty bool) int {
 	if o.list || o.json {
 		return runSearch(out, errw, args, o, tty, bg)
 	}
-	// the context: line goes on top, and it names only the marks the report
-	// shows: it comes after the rest is written
-	var body bytes.Buffer
-	w := bufio.NewWriter(&body)
+	// the context: line goes on top of the report, which streams after it
+	w := bufio.NewWriterSize(&lineFirst{w: out, line: bg.line}, 64<<10)
 	code = runSearch(w, errw, args, o, tty, bg)
 	w.Flush()
-	bg.wait()
-	if line := bg.line(); line != "" {
-		fmt.Fprintln(out, line)
-	}
-	out.Write(body.Bytes())
 	return code
 }
 
@@ -259,6 +251,7 @@ func runSearch(out *bufio.Writer, errw io.Writer, args []string, o options, tty 
 	if d := defsLine(gs, 3, p, layout, cx); d != "" {
 		head += "; defined at " + d
 	}
+	render.Marks(gs, layout, ro) // before the first line: see lineFirst
 	fmt.Fprintln(out, head)
 	if o.writes {
 		if n := allHits - hits; n > 0 {
@@ -785,7 +778,13 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 			have[f.Path+":"+strconv.Itoa(d.Line)] = true
 		}
 	}
+	// what will be printed hands out its marks before the first line (see
+	// lineFirst)
+	more, moreMarks := containing(o, p, paths, have, cx)
 	if total == 0 {
+		if more != "" {
+			cx.Show(moreMarks...)
+		}
 		fmt.Fprintf(out, "seek -d: %s in %s: no definition found", describe(p), scope)
 		if others > 0 {
 			if cmd := command("", searched); cmd != "" {
@@ -795,9 +794,8 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 			}
 		}
 		fmt.Fprintln(out)
-		if c, marks := containing(o, p, paths, have, cx); c != "" {
-			fmt.Fprintln(out, "  definitions whose names contain it: "+c)
-			cx.Show(marks...)
+		if more != "" {
+			fmt.Fprintln(out, "  definitions whose names contain it: "+more)
 		} else if others == 0 {
 			hints(out, o, p, paths)
 		}
@@ -807,12 +805,9 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 	if others > 0 {
 		head += fmt.Sprintf(", %s elsewhere", plural(others, "other hit"))
 	}
-	fmt.Fprintln(out, head)
-	more, moreMarks := containing(o, p, paths, have, cx)
 	printMore := func() {
 		if more != "" {
 			fmt.Fprintln(out, "definitions whose names contain it: "+more)
-			cx.Show(moreMarks...)
 		}
 	}
 	defs := orderedDefs(defFiles, cx) // the ones context marks first, all still shown
@@ -820,15 +815,30 @@ func definitions(out *bufio.Writer, o options, p *search.Pattern, gs []*group.Fi
 		if len(defs) > 0 && defs[0].f.Kind == "" && len(cx.Peek(symRefOf(shown(defs[0].f.Path), defs[0].d))) > 0 {
 			ro.Extra = 1 // the context: line, out of the code shown
 		}
-		render.Files(out, defBlocks(defs), ro)
+		blocks := defBlocks(defs)
+		l := render.Plan(blocks, ro)
+		render.Marks(blocks, l, ro)
+		if more != "" {
+			cx.Show(moreMarks...)
+		}
+		fmt.Fprintln(out, head)
+		render.Print(out, blocks, l, ro)
 		printMore()
 		return 0
 	}
 	// one line per definition and no detail to give up: the context: line
 	// goes on top of the budget (Prism's docs/output.md, rule 5)
+	room := max(ro.Budget, 1)
+	for _, x := range defs[:min(len(defs), room)] {
+		cx.Marks(symRefOf(shown(x.f.Path), x.d))
+	}
+	if more != "" && len(defs) <= room {
+		cx.Show(moreMarks...)
+	}
+	fmt.Fprintln(out, head)
 	for printed, x := range defs {
 		f, d := x.f, x.d
-		if printed >= max(ro.Budget, 1) {
+		if printed >= room {
 			fmt.Fprintf(out, "… %s (raise -b)\n", plural(total-printed, "more definition"))
 			return 0
 		}

@@ -141,7 +141,7 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 		listPaths(out, gs, o.null)
 		return exitCode(len(gs) > 0)
 	}
-	defFiles, inDefs, _ := refDefs(info, srcs, ts, m, p)
+	defFiles, inDefs, whole := refDefs(info, srcs, ts, m, p)
 	budget := 1 << 30
 	if o.budgetSet && o.budget > 0 {
 		budget = o.budget
@@ -154,13 +154,21 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 		// the definitions context marks first, all still shown
 		cx := bg.context()
 		markedFirst(m, refs, cx)
-		if o.bodies {
-			rank(defFiles, cx)
-		}
+		defFiles = refBlocks(defFiles, whole, ts, m, refs, cx)
 		roDefs.Mark = markFunc(cx)
+		// the marks first, then the lines (see lineFirst)
+		var l *render.Layout
+		if o.bodies {
+			l = render.Plan(defFiles, roDefs)
+			render.Marks(defFiles, l, roDefs)
+		} else {
+			for _, i := range m {
+				cx.Marks(refs[i].String())
+			}
+		}
 		fmt.Fprintf(out, "seek -d: %s: %s\n", typed, plural(len(m), "definition"))
 		if o.bodies {
-			render.Files(out, defFiles, roDefs)
+			render.Print(out, defFiles, l, roDefs)
 			return 0
 		}
 		for _, i := range m {
@@ -175,7 +183,7 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 	render.Order(rest)
 	cx := bg.context() // loaded while the search ran
 	markedFirst(m, refs, cx)
-	rank(defFiles, cx)
+	defFiles = refBlocks(defFiles, whole, ts, m, refs, cx) // in the header's order
 	rank(rest, cx)
 	ms := testMentions(rest, word)
 	next := mentionNext(info, ms, word)
@@ -285,6 +293,9 @@ func refSearch(out *bufio.Writer, errw io.Writer, o options, info *repo.Info, rp
 	}
 	if len(o.paths) > 0 || len(o.globs) > 0 {
 		then += " (searched " + scopeOf(o, st) + ")"
+	}
+	if hl != nil {
+		render.Marks(rest, hl, ro) // before the first line: see lineFirst
 	}
 	fmt.Fprintf(out, "seek: %s%s%s\n", what, sep, then)
 	if rp.shadowed != "" {
