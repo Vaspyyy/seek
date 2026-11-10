@@ -119,13 +119,15 @@ Text stays the default, and it's what agents should read: it's shorter, and it s
 
 ## For coding agents
 
+A ready-made Claude Code skill is in [`skill/SKILL.md`](skill/SKILL.md). Install it with `mkdir -p ~/.claude/skills/seek && cp skill/SKILL.md ~/.claude/skills/seek/`.
+
 When its output isn't a terminal, seek prints plain text, so an agent can use it directly. To make it the default, add a line like this to the agent's instructions (`AGENTS.md`, `CLAUDE.md` or similar):
 
 ```markdown
 - To search code, prefer `seek PATTERN [path]` over grep and rg: it groups hits by the function or
   class that contains them, with line ranges, so a follow-up read is rarely needed. `seek -d Name`
   finds definitions, `seek -s Name` prints the containing functions, and when nothing matches it
-  suggests similar existing names.
+  suggests similar existing names. Load the `seek` skill for details.
 ```
 
 To see whether it helps, I replayed the searches agents had made in one JavaScript project over several weeks (1,484 distinct grep calls) against the project's current code. seek's output alone was not smaller than grep's: grouping adds a line per definition and the header adds a line about hits in other casings or longer words, so small results grow and only the largest shrink.
