@@ -17,7 +17,7 @@ internal/group/group.go  691 lines
     666     if name != "" && strings.EqualFold(lastPart(h.Text[a:b]), name) {
   func bare  L675-680
     679 return lastPart(strings.TrimSpace(t))
-internal/suggest/suggest.go  424 lines
+internal/suggest/suggest.go  433 lines
   func Similar  L39-62
      45 qs[i] = newQuery(lastPart(w))
 ```
@@ -49,15 +49,15 @@ A pattern is a Go regular expression. One that is an identifier, or several join
 A pattern that is a ref to a file shows what the ref names. `seek internal/suggest/suggest.go:lastPart` prints that definition as `-s` would, doc comment included, then the hits of `lastPart` elsewhere in the repository, grouped as usual (its callers and mentions, and here other functions with its name):
 
 ```
-seek: internal/suggest/suggest.go:lastPart (func, L241-246), then 18 hits of "lastPart" in 5 files
-internal/suggest/suggest.go  424 lines
-  func lastPart  L241-246
-    241: func lastPart(name string) string {
-    242- 	if i := strings.LastIndexAny(name, ".:"); i >= 0 {
-    243- 		return name[i+1:]
-    244- 	}
-    245- 	return name
-    246- }
+seek: internal/suggest/suggest.go:lastPart (func, L250-255), then 18 hits of "lastPart" in 5 files
+internal/suggest/suggest.go  433 lines
+  func lastPart  L250-255
+    250: func lastPart(name string) string {
+    251- 	if i := strings.LastIndexAny(name, ".:"); i >= 0 {
+    252- 		return name[i+1:]
+    253- 	}
+    254- 	return name
+    255- }
 internal/group/group.go  691 lines
   func lastPart  L448-453
     448 func lastPart(name string) string {
