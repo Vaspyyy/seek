@@ -44,9 +44,8 @@ func Similar(words []string, paths []string, limit int, fold bool) []Name {
 	for i, w := range words {
 		qs[i] = newQuery(lastPart(w))
 	}
-	found := alike(paths, qs, fold)
-	out := make([]Name, 0, len(found))
-	for tok, st := range found {
+	var out []Name // nil when nothing is alike
+	for tok, st := range alike(paths, qs, fold) {
 		sort.Strings(st.paths)
 		out = append(out, Name{Word: tok, Count: st.count, Paths: st.paths, Line: st.first[st.paths[0]], score: st.score})
 	}
@@ -141,22 +140,25 @@ func init() {
 	}
 }
 
-// scan counts the names in data that are alike: a line counts once, as in
-// the search.
-func (s *scanner) scan(path string, data []byte) {
-	s.files++
-	line, at := 1, 0 // the line of data[at]
-	for i := 0; i < len(data); {
+// name returns where the first name at or after i in data starts and ends;
+// it starts at len(data) when there's none.
+func name(data []byte, i int) (start, end int) {
+	for i < len(data) {
+		// What starts a name is passed here, so the scan moves on
+		// whatever continues one.
+		start = i
 		if c := data[i]; c < utf8.RuneSelf {
+			i++
 			if !startByte[c] {
-				i++
 				continue
 			}
-		} else if r, n := utf8.DecodeRune(data[i:]); !unicode.IsLetter(r) {
+		} else {
+			r, n := utf8.DecodeRune(data[i:])
 			i += n
-			continue
+			if !unicode.IsLetter(r) {
+				continue
+			}
 		}
-		a := i
 		for i < len(data) {
 			if c := data[i]; c < utf8.RuneSelf {
 				if !contByte[c] {
@@ -169,6 +171,17 @@ func (s *scanner) scan(path string, data []byte) {
 				break
 			}
 		}
+		return start, i
+	}
+	return len(data), len(data)
+}
+
+// scan counts the names in data that are alike: a line counts once, as in
+// the search.
+func (s *scanner) scan(path string, data []byte) {
+	s.files++
+	line, at := 1, 0 // the line of data[at]
+	for a, i := name(data, 0); a < len(data); a, i = name(data, i) {
 		if i-a < 3 {
 			continue
 		}
