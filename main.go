@@ -30,56 +30,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.5.1"
-
-const usage = `seek: search code, with hits grouped by the definition that contains them
-
-usage: seek [flags] PATTERN [PATH...]
-
-A pattern is a regular expression (Go syntax). One that is an identifier,
-or several joined by | ("setSpeed", "Repo.Open", "a|b|c"), matches whole
-words only. An invalid regex is searched as plain text.
-
-A pattern that is a ref to a file seek can find ("internal/files/files.go:List",
-"files.go:globSet.match", "main.go:104") shows that definition (for a line:
-the innermost one containing it), then the hits of its name elsewhere,
-grouped as usual. With -F or -e the pattern is always a pattern.
-
-  -d          definitions only: where PATTERN is defined, one line each
-  -s          show the whole definition around each hit (windows in long ones)
-  -c          counts: at most one line per definition
-  -l          only the paths of files with hits (-0: separated by NUL bytes;
-              with -d, the files that define it)
-  -C N        N lines of context around each hit (with -s: the window size)
-  -i          ignore case
-  -F          plain text, not a regex
-  -w          whole words, also for a regex
-  --partial   identifiers also inside longer words (speed finds speedMult)
-  --writes    only hits that set the name: definitions, declarations, assignments
-  -g GLOB     only files matching GLOB ("*.js", "src/**", "!*_test.go"); repeatable
-  -u          also ignored files, caches and dot-folders
-  -b N        about how many lines to print (default 100, with -s 300; 0: no limit)
-  -e PATTERN  a pattern that starts with "-" (or that isn't a ref)
-  -A          plain output without colors (the default when not on a terminal)
-  --json      one JSON document instead of the text (Prism's report.Seek):
-              every hit, with no line budget unless -b N is given (N hits)
-  --no-context  ignore and don't record context; also PRISM_NO_CONTEXT=1
-  --version
-
-Context is on by default: definitions changed in the working tree
-[changed] or on this branch [branch], in the commit recap last showed
-[focus] or failing in crux's last run [failing] get that mark after their
-name and come first. Nothing is left out for it. A "context:" line on top
-says what was used.
-
-In ref mode, hits in tests are labelled "(test, mentions NAME)", and a
-"next:" line at the bottom gives the crux command that runs those tests.
-
-Files are what git sees in a repository (tracked and untracked, not
-ignored); elsewhere caches, build output and dot-folders are skipped.
-Paths are printed relative to the repository root.
-Exit status: 0 if something matched, 1 if not, 2 on errors.
-`
+const version = "0.5.2"
 
 type options struct {
 	pattern                    string
@@ -1202,8 +1153,8 @@ func parse(args []string) (options, int, string) {
 			rest = append(rest, args[i+1:]...)
 			i = len(args)
 		case a == "-h" || a == "--help":
-			return o, 0, usage
-		case a == "--version":
+			return o, 0, helpText(wantsColor(os.Stdout))
+		case a == "-V" || a == "--version":
 			return o, 0, "seek " + version + "\n"
 		case a == "--partial":
 			o.so.Partial = true
@@ -1225,7 +1176,7 @@ func parse(args []string) (options, int, string) {
 				msg = o.setValue(a[1], s, number)
 			}
 		case strings.HasPrefix(a, "--"):
-			msg = "unknown flag " + a + " (seek -h lists them)"
+			msg = "unknown flag " + a + " (see seek --help)"
 		case strings.HasPrefix(a, "-") && len(a) > 1:
 			// combined short flags: -is, -C3, -b50, -g*.js
 			for k := 1; k < len(a) && msg == ""; k++ {
@@ -1265,7 +1216,7 @@ func parse(args []string) (options, int, string) {
 					}
 					k = len(a)
 				default:
-					msg = "unknown flag -" + string(c) + " (seek -h lists them)"
+					msg = "unknown flag -" + string(c) + " (see seek --help)"
 					if len(a) > 2 && !o.havePattern && len(rest) == 0 {
 						msg = fmt.Sprintf("unknown flag -%c in %q; a pattern that starts with - goes after -e or --: seek -e %s", c, a, a)
 					}
@@ -1280,7 +1231,7 @@ func parse(args []string) (options, int, string) {
 	}
 	if !o.havePattern {
 		if len(rest) == 0 {
-			return o, 2, "what should I search for? usage: seek [flags] PATTERN [PATH...] (seek -h for more)"
+			return o, 2, "what should I search for? usage: seek [flags] PATTERN [PATH...] (see seek --help)"
 		}
 		o.pattern, rest = rest[0], rest[1:]
 	}
